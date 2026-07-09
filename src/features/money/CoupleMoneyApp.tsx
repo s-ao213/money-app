@@ -186,11 +186,17 @@ export default function CoupleMoneyApp({ view }: { view: AppView }) {
     const client = supabase;
 
     async function restoreSession() {
+      const url = new URL(window.location.href);
+      const authCode = url.searchParams.get("code");
       const hash = new URLSearchParams(window.location.hash.slice(1));
       const accessToken = hash.get("access_token");
       const refreshToken = hash.get("refresh_token");
 
-      if (accessToken && refreshToken) {
+      if (authCode) {
+        await client.auth.exchangeCodeForSession(authCode);
+        url.searchParams.delete("code");
+        window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+      } else if (accessToken && refreshToken) {
         await client.auth.setSession({
           access_token: accessToken,
           refresh_token: refreshToken,
