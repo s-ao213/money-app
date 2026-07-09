@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { createClient, type Session, type SupabaseClient, type User } from "@supabase/supabase-js";
+import Link from "next/link";
+import { type Session, type SupabaseClient, type User } from "@supabase/supabase-js";
+import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import {
   ArrowDownLeft,
   ArrowUpRight,
@@ -92,11 +94,6 @@ type PaymentRow = {
   status: "予定" | "完了" | "不足";
 };
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-const supabase =
-  supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null;
-
 const yen = new Intl.NumberFormat("ja-JP", {
   style: "currency",
   currency: "JPY",
@@ -174,12 +171,10 @@ function subscriptionOccurs(subscription: Subscription, month: string) {
   return Number(month.slice(5, 7)) === subscription.billing_month;
 }
 
-function getSupabaseOrThrow() {
-  if (!supabase) throw new Error("Supabase environment variables are missing.");
-  return supabase;
-}
+export type AppView = "dashboard" | "subscriptions" | "loans" | "personal" | "settings";
 
-export default function Home() {
+export default function CoupleMoneyApp({ view }: { view: AppView }) {
+  const supabase = getSupabaseBrowserClient();
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -205,11 +200,18 @@ export default function Home() {
   if (loading) return <FullPageMessage title="読み込み中" body="Supabaseの認証状態を確認しています。" />;
   if (!session) return <AuthScreen supabase={supabase} />;
 
-  return <MoneyApp supabase={supabase} user={session.user} />;
+  return <MoneyApp supabase={supabase} user={session.user} view={view} />;
 }
 
-function MoneyApp({ supabase, user }: { supabase: SupabaseClient; user: User }) {
-  const [activeTab, setActiveTab] = useState("dashboard");
+function MoneyApp({
+  supabase,
+  user,
+  view,
+}: {
+  supabase: SupabaseClient;
+  user: User;
+  view: AppView;
+}) {
   const [selectedMonth, setSelectedMonth] = useState(currentMonth);
   const [displayName, setDisplayName] = useState("");
   const [pairId, setPairId] = useState<string | null>(null);
@@ -535,11 +537,11 @@ function MoneyApp({ supabase, user }: { supabase: SupabaseClient; user: User }) 
         </div>
 
         <nav className="nav">
-          <NavButton icon={<ReceiptText />} label="ダッシュボード" active={activeTab === "dashboard"} onClick={() => setActiveTab("dashboard")} />
-          <NavButton icon={<RefreshCcw />} label="サブスク" active={activeTab === "subscriptions"} onClick={() => setActiveTab("subscriptions")} disabled={!pairId} />
-          <NavButton icon={<HandCoins />} label="貸し借り" active={activeTab === "loans"} onClick={() => setActiveTab("loans")} disabled={!pairId} />
-          <NavButton icon={<Banknote />} label="個人収支" active={activeTab === "personal"} onClick={() => setActiveTab("personal")} />
-          <NavButton icon={<ShieldCheck />} label="設定" active={activeTab === "settings"} onClick={() => setActiveTab("settings")} />
+          <NavButton icon={<ReceiptText />} label="ダッシュボード" href="/" active={view === "dashboard"} />
+          <NavButton icon={<RefreshCcw />} label="サブスク" href="/subscriptions" active={view === "subscriptions"} disabled={!pairId} />
+          <NavButton icon={<HandCoins />} label="貸し借り" href="/loans" active={view === "loans"} disabled={!pairId} />
+          <NavButton icon={<Banknote />} label="個人収支" href="/personal" active={view === "personal"} />
+          <NavButton icon={<ShieldCheck />} label="設定" href="/settings" active={view === "settings"} />
         </nav>
 
         <div className="security-note">
@@ -574,7 +576,7 @@ function MoneyApp({ supabase, user }: { supabase: SupabaseClient; user: User }) 
 
         {!pairId && <PairSetup displayName={displayName} setDisplayName={setDisplayName} saveProfile={saveProfile} createPair={createPair} joinPair={joinPair} inviteCode={inviteCode} joinCode={joinCode} setJoinCode={setJoinCode} />}
 
-        {activeTab === "dashboard" && (
+        {view === "dashboard" && (
           <section className="view">
             <div className="summary-grid">
               <Metric icon={<ArrowUpRight />} label="私が今月払う" value={yen.format(myOutgoing)} tone="dark" />
@@ -596,7 +598,7 @@ function MoneyApp({ supabase, user }: { supabase: SupabaseClient; user: User }) 
           </section>
         )}
 
-        {activeTab === "subscriptions" && (
+        {view === "subscriptions" && (
           <section className="view">
             <Panel title="共有サブスクを追加" action="契約者と精算を分けて計算">
               <div className="form-grid">
@@ -637,7 +639,7 @@ function MoneyApp({ supabase, user }: { supabase: SupabaseClient; user: User }) 
           </section>
         )}
 
-        {activeTab === "loans" && (
+        {view === "loans" && (
           <section className="view">
             <Panel title="貸し借りを追加" action="一括・分割・任意返済">
               <div className="form-grid">
@@ -693,7 +695,7 @@ function MoneyApp({ supabase, user }: { supabase: SupabaseClient; user: User }) 
           </section>
         )}
 
-        {activeTab === "personal" && (
+        {view === "personal" && (
           <section className="view">
             <Panel title="個人収支を追加" action="本人だけの家計簿データ">
               <div className="form-grid">
@@ -716,7 +718,7 @@ function MoneyApp({ supabase, user }: { supabase: SupabaseClient; user: User }) 
           </section>
         )}
 
-        {activeTab === "settings" && (
+        {view === "settings" && (
           <section className="view">
             <Panel title="設定" action={user.email || ""}>
               <div className="form-grid">
@@ -767,7 +769,15 @@ function AuthScreen({ supabase }: { supabase: SupabaseClient }) {
     const result =
       mode === "signin"
         ? await supabase.auth.signInWithPassword({ email, password })
-        : await supabase.auth.signUp({ email, password });
+        : await supabase.auth.signUp({
+            email,
+            password,
+            options: {
+              emailRedirectTo:
+                process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ||
+                window.location.origin,
+            },
+          });
 
     if (result.error) setMessage(result.error.message);
     else if (mode === "signup") setMessage("登録しました。メール確認が必要な場合は、受信箱を確認してください。");
@@ -909,12 +919,33 @@ function Ledger({ entries }: { entries: PersonalEntry[] }) {
   );
 }
 
-function NavButton({ icon, label, active, disabled, onClick }: { icon: React.ReactNode; label: string; active: boolean; disabled?: boolean; onClick: () => void }) {
+function NavButton({
+  icon,
+  label,
+  href,
+  active,
+  disabled,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  href: string;
+  active: boolean;
+  disabled?: boolean;
+}) {
+  if (disabled) {
+    return (
+      <span className="nav-button" aria-disabled="true">
+        {icon}
+        <span>{label}</span>
+      </span>
+    );
+  }
+
   return (
-    <button className={active ? "nav-button active" : "nav-button"} onClick={onClick} disabled={disabled}>
+    <Link className={active ? "nav-button active" : "nav-button"} href={href}>
       {icon}
       <span>{label}</span>
-    </button>
+    </Link>
   );
 }
 
