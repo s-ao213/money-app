@@ -183,13 +183,29 @@ export default function CoupleMoneyApp({ view }: { view: AppView }) {
       setLoading(false);
       return;
     }
+    const client = supabase;
 
-    supabase.auth.getSession().then(({ data }) => {
+    async function restoreSession() {
+      const hash = new URLSearchParams(window.location.hash.slice(1));
+      const accessToken = hash.get("access_token");
+      const refreshToken = hash.get("refresh_token");
+
+      if (accessToken && refreshToken) {
+        await client.auth.setSession({
+          access_token: accessToken,
+          refresh_token: refreshToken,
+        });
+        window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      }
+
+      const { data } = await client.auth.getSession();
       setSession(data.session);
       setLoading(false);
-    });
+    }
 
-    const { data } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+    void restoreSession();
+
+    const { data } = client.auth.onAuthStateChange((_event, nextSession) => {
       setSession(nextSession);
     });
 
@@ -774,8 +790,10 @@ function AuthScreen({ supabase }: { supabase: SupabaseClient }) {
             password,
             options: {
               emailRedirectTo:
-                process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ||
-                window.location.origin,
+                `${
+                  process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") ||
+                  window.location.origin
+                }/auth/callback`,
             },
           });
 

@@ -7,7 +7,15 @@ export function getSupabaseBrowserClient() {
 
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-  browserClient = url && anonKey ? createClient(url, anonKey) : null;
+  browserClient =
+    url && anonKey
+      ? createClient(url, anonKey, {
+          auth: {
+            flowType: "pkce",
+            detectSessionInUrl: false,
+          },
+        })
+      : null;
 
   return browserClient;
 }
