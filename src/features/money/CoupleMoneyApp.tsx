@@ -10,6 +10,7 @@ import {
   Banknote,
   CalendarDays,
   CheckCircle2,
+  Copy,
   Download,
   HandCoins,
   Lock,
@@ -18,6 +19,7 @@ import {
   ReceiptText,
   RefreshCcw,
   ShieldCheck,
+  UserRound,
   Users,
   WalletCards,
 } from "lucide-react";
@@ -171,7 +173,13 @@ function subscriptionOccurs(subscription: Subscription, month: string) {
   return Number(month.slice(5, 7)) === subscription.billing_month;
 }
 
-export type AppView = "dashboard" | "subscriptions" | "loans" | "personal" | "settings";
+export type AppView =
+  | "dashboard"
+  | "subscriptions"
+  | "loans"
+  | "personal"
+  | "pair"
+  | "profile";
 
 export default function CoupleMoneyApp({ view }: { view: AppView }) {
   const supabase = getSupabaseBrowserClient();
@@ -438,6 +446,21 @@ function MoneyApp({
     }
   }
 
+  async function regenerateInvite() {
+    if (!pairId || partner) return;
+    const code = makeInviteCode();
+    const codeHash = await sha256(code);
+    const { error } = await supabase.rpc("regenerate_pair_invite_hash", {
+      pair_id_input: pairId,
+      invite_hash: codeHash,
+    });
+    if (error) setMessage(error.message);
+    else {
+      setInviteCode(code);
+      setMessage("新しい招待コードを発行しました。");
+    }
+  }
+
   async function joinPair() {
     if (!displayName.trim() || !joinCode.trim()) {
       setMessage("表示名と招待コードを入力してください。");
@@ -563,7 +586,8 @@ function MoneyApp({
           <NavButton icon={<RefreshCcw />} label="サブスク" href="/subscriptions" active={view === "subscriptions"} disabled={!pairId} />
           <NavButton icon={<HandCoins />} label="貸し借り" href="/loans" active={view === "loans"} disabled={!pairId} />
           <NavButton icon={<Banknote />} label="個人収支" href="/personal" active={view === "personal"} />
-          <NavButton icon={<ShieldCheck />} label="設定" href="/settings" active={view === "settings"} />
+          <NavButton icon={<Users />} label="ペア設定" href="/pair" active={view === "pair"} />
+          <NavButton icon={<UserRound />} label="自分の設定" href="/profile" active={view === "profile"} />
         </nav>
 
         <div className="security-note">
@@ -596,10 +620,13 @@ function MoneyApp({
 
         {message && <div className="notice">{message}</div>}
 
-        {!pairId && <PairSetup displayName={displayName} setDisplayName={setDisplayName} saveProfile={saveProfile} createPair={createPair} joinPair={joinPair} inviteCode={inviteCode} joinCode={joinCode} setJoinCode={setJoinCode} />}
-
         {view === "dashboard" && (
           <section className="view">
+            {!pairId && (
+              <div className="notice">
+                ペアはまだ設定されていません。<Link href="/pair">ペア設定を開く</Link>
+              </div>
+            )}
             <div className="summary-grid">
               <Metric icon={<ArrowUpRight />} label="私が今月払う" value={yen.format(myOutgoing)} tone="dark" />
               <Metric icon={<ArrowDownLeft />} label="私が今月受け取る" value={yen.format(myIncoming)} tone="blue" />
@@ -740,10 +767,38 @@ function MoneyApp({
           </section>
         )}
 
-        {view === "settings" && (
+        {view === "pair" && (
           <section className="view">
-            <Panel title="設定" action={user.email || ""}>
-              <div className="form-grid">
+            {!displayName.trim() ? (
+              <Panel title="先に自分の設定を完了してください" action="表示名が必要です">
+                <p className="empty">ペアを作成・参加する前に、あなたの表示名を登録してください。</p>
+                <Link className="button primary form-submit" href="/profile">自分の設定を開く</Link>
+              </Panel>
+            ) : !pairId ? (
+              <PairSetup
+                createPair={createPair}
+                joinPair={joinPair}
+                inviteCode={inviteCode}
+                joinCode={joinCode}
+                setJoinCode={setJoinCode}
+              />
+            ) : (
+              <PairManagement
+                members={members}
+                currentUserId={user.id}
+                inviteCode={inviteCode}
+                canInvite={!partner}
+                regenerateInvite={regenerateInvite}
+                setMessage={setMessage}
+              />
+            )}
+          </section>
+        )}
+
+        {view === "profile" && (
+          <section className="view">
+            <Panel title="自分の設定" action={user.email || ""}>
+              <div className="form-grid compact-form">
                 <TextField label="表示名" value={displayName} onChange={setDisplayName} />
               </div>
               <button className="button primary form-submit" onClick={saveProfile}>表示名を保存</button>
@@ -831,18 +886,12 @@ function AuthScreen({ supabase }: { supabase: SupabaseClient }) {
 }
 
 function PairSetup({
-  displayName,
-  setDisplayName,
-  saveProfile,
   createPair,
   joinPair,
   inviteCode,
   joinCode,
   setJoinCode,
 }: {
-  displayName: string;
-  setDisplayName: (value: string) => void;
-  saveProfile: () => void;
   createPair: () => void;
   joinPair: () => void;
   inviteCode: string;
@@ -851,14 +900,9 @@ function PairSetup({
 }) {
   return (
     <section className="view setup-view">
-      <Panel title="最初の設定" action="ペアを作成または参加">
-        <div className="form-grid">
-          <TextField label="あなたの表示名" value={displayName} onChange={setDisplayName} />
-        </div>
-        <div className="button-row">
-          <button className="button dark" onClick={saveProfile}>表示名を保存</button>
-          <button className="button primary" onClick={createPair}>ペアを作成</button>
-        </div>
+      <Panel title="新しいペアを作成" action="招待コードを発行">
+        <p className="empty">あなたがペアを作成し、発行されたコードを相手に共有します。</p>
+        <button className="button primary form-submit" onClick={createPair}>ペアを作成</button>
         {inviteCode && <div className="invite-code">{inviteCode}</div>}
       </Panel>
       <Panel title="相手のペアに参加" action="招待コードを入力">
@@ -868,6 +912,68 @@ function PairSetup({
         <button className="button primary form-submit" onClick={joinPair}>参加する</button>
       </Panel>
     </section>
+  );
+}
+
+function PairManagement({
+  members,
+  currentUserId,
+  inviteCode,
+  canInvite,
+  regenerateInvite,
+  setMessage,
+}: {
+  members: PairMember[];
+  currentUserId: string;
+  inviteCode: string;
+  canInvite: boolean;
+  regenerateInvite: () => void;
+  setMessage: (message: string) => void;
+}) {
+  async function copyInviteCode() {
+    if (!inviteCode) return;
+    try {
+      await navigator.clipboard.writeText(inviteCode);
+      setMessage("招待コードをコピーしました。");
+    } catch {
+      setMessage("コピーできませんでした。表示されたコードを長押ししてコピーしてください。");
+    }
+  }
+
+  return (
+    <>
+      <Panel title="ペアのメンバー" action={`${members.length}/2人`}>
+        <div className="member-list">
+          {members.map((member) => (
+            <div className="member-row" key={member.user_id}>
+              <UserRound size={18} />
+              <strong>{member.display_name}</strong>
+              <span>{member.user_id === currentUserId ? "あなた" : "相方"}</span>
+            </div>
+          ))}
+        </div>
+      </Panel>
+
+      <Panel title="相手を招待" action={canInvite ? "参加者を募集中" : "設定済み"}>
+        {canInvite ? (
+          <>
+            <p className="empty">招待コードは再発行するたびに古いコードが無効になります。</p>
+            <div className="button-row">
+              <button className="button primary" onClick={regenerateInvite}>招待コードを発行</button>
+              {inviteCode && (
+                <button className="button ghost" onClick={copyInviteCode}>
+                  <Copy size={16} />
+                  コピー
+                </button>
+              )}
+            </div>
+            {inviteCode && <div className="invite-code">{inviteCode}</div>}
+          </>
+        ) : (
+          <p className="empty">2人のペア設定が完了しています。</p>
+        )}
+      </Panel>
+    </>
   );
 }
 
