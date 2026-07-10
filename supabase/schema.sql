@@ -224,6 +224,44 @@ begin
 end;
 $$;
 
+create or replace function public.regenerate_pair_invite_hash(
+  pair_id_input uuid,
+  invite_hash text
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  member_count integer;
+begin
+  if auth.uid() is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  if invite_hash !~ '^[0-9a-f]{64}$' then
+    raise exception '招待コードの形式が正しくありません';
+  end if;
+
+  if not public.is_pair_member(pair_id_input) then
+    raise exception 'このペアを変更する権限がありません';
+  end if;
+
+  select count(*) into member_count
+  from public.pair_members
+  where pair_id = pair_id_input;
+
+  if member_count >= 2 then
+    raise exception 'このペアはすでに2人で利用中です';
+  end if;
+
+  update public.pairs
+  set invite_code_hash = invite_hash
+  where id = pair_id_input;
+end;
+$$;
+
 alter table public.profiles enable row level security;
 alter table public.pairs enable row level security;
 alter table public.pair_members enable row level security;
@@ -320,5 +358,9 @@ for update using (user_id = auth.uid()) with check (user_id = auth.uid());
 
 grant usage on schema public to anon, authenticated;
 grant select on public.pair_member_profiles to authenticated;
+revoke all on function public.create_pair_with_invite_hash(text, text, text) from public, anon;
+revoke all on function public.join_pair_with_invite_hash(text, text) from public, anon;
+revoke all on function public.regenerate_pair_invite_hash(uuid, text) from public, anon;
 grant execute on function public.create_pair_with_invite_hash(text, text, text) to authenticated;
 grant execute on function public.join_pair_with_invite_hash(text, text) to authenticated;
+grant execute on function public.regenerate_pair_invite_hash(uuid, text) to authenticated;
