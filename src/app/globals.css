@@ -466,6 +466,30 @@ td:nth-child(5) {
   gap: 12px;
 }
 
+.compact-form {
+  grid-template-columns: minmax(220px, 420px);
+}
+
+.member-list {
+  display: grid;
+  gap: 10px;
+}
+
+.member-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+}
+
+.member-row span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .field {
   display: grid;
   gap: 6px;
@@ -619,15 +643,31 @@ dd {
   .sidebar {
     position: static;
     height: auto;
-    padding: 18px;
+    gap: 14px;
+    padding: 16px;
   }
 
   .nav {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    display: flex;
+    margin: 0 -16px;
+    overflow-x: auto;
+    padding: 0 16px 6px;
+    scrollbar-width: thin;
+  }
+
+  .nav-button {
+    flex: 0 0 auto;
+    width: auto;
+    min-height: 40px;
+    white-space: nowrap;
+  }
+
+  .security-note {
+    display: none;
   }
 
   .workspace {
-    padding: 18px;
+    padding: 16px;
   }
 
   .topbar {
@@ -636,8 +676,14 @@ dd {
   }
 
   .topbar-actions {
-    display: grid;
-    grid-template-columns: 1fr;
+    display: flex;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+
+  .topbar-actions .button {
+    flex: 0 0 auto;
   }
 
   .summary-grid,
@@ -649,5 +695,59 @@ dd {
 
   .repayment-form {
     grid-template-columns: 1fr;
+  }
+
+  .panel,
+  .item-card {
+    padding: 14px;
+  }
+
+  .panel-heading,
+  .item-heading,
+  .button-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .button-row .button,
+  .form-submit {
+    width: 100%;
+  }
+
+  .ledger-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .ledger-row b {
+    grid-column: 2;
+    text-align: left;
+  }
+
+  .table-wrap {
+    margin: 0 -14px;
+    padding: 0 14px;
+  }
+}
+
+@media (max-width: 480px) {
+  .brand h1 {
+    font-size: 19px;
+  }
+
+  .summary-grid {
+    gap: 10px;
+  }
+
+  .metric {
+    min-height: 132px;
+    padding: 14px;
+  }
+
+  .metric strong {
+    overflow-wrap: anywhere;
+  }
+
+  .month-input {
+    width: 100%;
   }
 }
