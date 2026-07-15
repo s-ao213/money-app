@@ -1,5 +1,5 @@
 import CoupleMoneyApp from "@/features/money/CoupleMoneyApp";
 
-export default function SettingsPage() {
+export default function MyPage() {
   return <CoupleMoneyApp view="myPage" />;
 }

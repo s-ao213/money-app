@@ -8,3 +8,7 @@ node_modules/
 *.tsbuildinfo
 *.zip
 .env*.local
+
+.vercel
+.env*
+.publish-temp/

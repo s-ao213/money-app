@@ -3,6 +3,7 @@ create extension if not exists pgcrypto;
 create table if not exists public.profiles (
   id uuid primary key references auth.users(id) on delete cascade,
   display_name text not null default '',
+  avatar_url text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -10,6 +11,7 @@ create table if not exists public.profiles (
 create table if not exists public.pairs (
   id uuid primary key default gen_random_uuid(),
   name text not null default 'ふたりの家計簿',
+  icon_url text,
   invite_code_hash text not null unique,
   created_by uuid not null references auth.users(id) on delete cascade,
   created_at timestamptz not null default now()
@@ -20,6 +22,7 @@ create table if not exists public.pair_members (
   pair_id uuid not null references public.pairs(id) on delete cascade,
   user_id uuid not null references auth.users(id) on delete cascade,
   role text not null default 'member' check (role in ('owner', 'member')),
+  display_name text not null default '',
   joined_at timestamptz not null default now(),
   unique (pair_id, user_id)
 );
@@ -81,9 +84,43 @@ create table if not exists public.personal_entries (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists public.personal_categories (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  pair_id uuid references public.pairs(id) on delete cascade,
+  type text not null check (type in ('income', 'expense')),
+  name text not null check (char_length(trim(name)) between 1 and 50),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.workplaces (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  name text not null check (char_length(trim(name)) between 1 and 80),
+  payday_day integer check (payday_day between 1 and 31),
+  payday_is_month_end boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  check (payday_is_month_end or payday_day is not null)
+);
+
+alter table public.profiles add column if not exists avatar_url text;
+alter table public.pairs add column if not exists icon_url text;
+alter table public.pair_members add column if not exists display_name text not null default '';
+
+create unique index if not exists personal_categories_private_name_unique
+on public.personal_categories (user_id, type, name)
+where pair_id is null;
+
+create unique index if not exists personal_categories_shared_name_unique
+on public.personal_categories (pair_id, type, name)
+where pair_id is not null;
+
 create or replace function public.touch_updated_at()
 returns trigger
 language plpgsql
+set search_path = public
 as $$
 begin
   new.updated_at = now();
@@ -105,6 +142,14 @@ for each row execute function public.touch_updated_at();
 
 drop trigger if exists personal_entries_touch_updated_at on public.personal_entries;
 create trigger personal_entries_touch_updated_at before update on public.personal_entries
+for each row execute function public.touch_updated_at();
+
+drop trigger if exists personal_categories_touch_updated_at on public.personal_categories;
+create trigger personal_categories_touch_updated_at before update on public.personal_categories
+for each row execute function public.touch_updated_at();
+
+drop trigger if exists workplaces_touch_updated_at on public.workplaces;
+create trigger workplaces_touch_updated_at before update on public.workplaces
 for each row execute function public.touch_updated_at();
 
 create or replace function public.is_pair_member(pair_uuid uuid)
@@ -135,11 +180,13 @@ as $$
   );
 $$;
 
-create or replace view public.pair_member_profiles as
+create or replace view public.pair_member_profiles
+with (security_invoker = true)
+as
 select
   pm.pair_id,
   pm.user_id,
-  coalesce(nullif(p.display_name, ''), 'メンバー') as display_name,
+  coalesce(nullif(pm.display_name, ''), nullif(p.display_name, ''), 'メンバー') as display_name,
   pm.role,
   pm.joined_at
 from public.pair_members pm
@@ -149,7 +196,8 @@ where public.is_pair_member(pm.pair_id);
 create or replace function public.create_pair_with_invite_hash(
   pair_name text,
   invite_hash text,
-  display_name_input text
+  display_name_input text,
+  icon_url_input text default null
 )
 returns uuid
 language plpgsql
@@ -167,12 +215,12 @@ begin
   values (auth.uid(), coalesce(nullif(display_name_input, ''), '私'))
   on conflict (id) do update set display_name = excluded.display_name;
 
-  insert into public.pairs (name, invite_code_hash, created_by)
-  values (coalesce(nullif(pair_name, ''), 'ふたりの家計簿'), invite_hash, auth.uid())
+  insert into public.pairs (name, icon_url, invite_code_hash, created_by)
+  values (coalesce(nullif(pair_name, ''), 'ふたりの家計簿'), icon_url_input, invite_hash, auth.uid())
   returning id into new_pair_id;
 
-  insert into public.pair_members (pair_id, user_id, role)
-  values (new_pair_id, auth.uid(), 'owner');
+  insert into public.pair_members (pair_id, user_id, role, display_name)
+  values (new_pair_id, auth.uid(), 'owner', coalesce(nullif(display_name_input, ''), '私'));
 
   return new_pair_id;
 end;
@@ -216,8 +264,8 @@ begin
   values (auth.uid(), coalesce(nullif(display_name_input, ''), '相方'))
   on conflict (id) do update set display_name = excluded.display_name;
 
-  insert into public.pair_members (pair_id, user_id, role)
-  values (target_pair_id, auth.uid(), 'member')
+  insert into public.pair_members (pair_id, user_id, role, display_name)
+  values (target_pair_id, auth.uid(), 'member', coalesce(nullif(display_name_input, ''), '相方'))
   on conflict (pair_id, user_id) do nothing;
 
   return target_pair_id;
@@ -269,6 +317,8 @@ alter table public.subscriptions enable row level security;
 alter table public.loans enable row level security;
 alter table public.loan_repayments enable row level security;
 alter table public.personal_entries enable row level security;
+alter table public.personal_categories enable row level security;
+alter table public.workplaces enable row level security;
 
 drop policy if exists "profiles self select" on public.profiles;
 create policy "profiles self select" on public.profiles
@@ -282,9 +332,19 @@ drop policy if exists "pairs member select" on public.pairs;
 create policy "pairs member select" on public.pairs
 for select using (public.is_pair_member(id));
 
+drop policy if exists "pairs member update" on public.pairs;
+create policy "pairs member update" on public.pairs
+for update using (public.is_pair_member(id))
+with check (public.is_pair_member(id));
+
 drop policy if exists "pair_members member select" on public.pair_members;
 create policy "pair_members member select" on public.pair_members
 for select using (public.is_pair_member(pair_id));
+
+drop policy if exists "pair_members self update" on public.pair_members;
+create policy "pair_members self update" on public.pair_members
+for update using (user_id = auth.uid())
+with check (user_id = auth.uid());
 
 drop policy if exists "subscriptions member select" on public.subscriptions;
 create policy "subscriptions member select" on public.subscriptions
@@ -356,11 +416,69 @@ drop policy if exists "personal entries self update" on public.personal_entries;
 create policy "personal entries self update" on public.personal_entries
 for update using (user_id = auth.uid()) with check (user_id = auth.uid());
 
+drop policy if exists "personal entries self delete" on public.personal_entries;
+create policy "personal entries self delete" on public.personal_entries
+for delete using (user_id = auth.uid());
+
+drop policy if exists "personal categories select" on public.personal_categories;
+create policy "personal categories select" on public.personal_categories
+for select to authenticated
+using (
+  user_id = (select auth.uid())
+  or (pair_id is not null and public.is_pair_member(pair_id))
+);
+
+drop policy if exists "personal categories insert" on public.personal_categories;
+create policy "personal categories insert" on public.personal_categories
+for insert to authenticated
+with check (
+  user_id = (select auth.uid())
+  and (pair_id is null or public.is_pair_member(pair_id))
+);
+
+drop policy if exists "personal categories update" on public.personal_categories;
+create policy "personal categories update" on public.personal_categories
+for update to authenticated
+using (user_id = (select auth.uid()))
+with check (
+  user_id = (select auth.uid())
+  and (pair_id is null or public.is_pair_member(pair_id))
+);
+
+drop policy if exists "personal categories delete" on public.personal_categories;
+create policy "personal categories delete" on public.personal_categories
+for delete to authenticated
+using (user_id = (select auth.uid()));
+
+drop policy if exists "workplaces self select" on public.workplaces;
+create policy "workplaces self select" on public.workplaces
+for select to authenticated
+using (user_id = (select auth.uid()));
+
+drop policy if exists "workplaces self insert" on public.workplaces;
+create policy "workplaces self insert" on public.workplaces
+for insert to authenticated
+with check (user_id = (select auth.uid()));
+
+drop policy if exists "workplaces self update" on public.workplaces;
+create policy "workplaces self update" on public.workplaces
+for update to authenticated
+using (user_id = (select auth.uid()))
+with check (user_id = (select auth.uid()));
+
+drop policy if exists "workplaces self delete" on public.workplaces;
+create policy "workplaces self delete" on public.workplaces
+for delete to authenticated
+using (user_id = (select auth.uid()));
+
 grant usage on schema public to anon, authenticated;
+grant select, insert, update, delete on public.workplaces to authenticated;
+grant select, insert, update, delete on public.personal_categories to authenticated;
 grant select on public.pair_member_profiles to authenticated;
-revoke all on function public.create_pair_with_invite_hash(text, text, text) from public, anon;
+drop function if exists public.create_pair_with_invite_hash(text, text, text);
+revoke all on function public.create_pair_with_invite_hash(text, text, text, text) from public, anon;
 revoke all on function public.join_pair_with_invite_hash(text, text) from public, anon;
 revoke all on function public.regenerate_pair_invite_hash(uuid, text) from public, anon;
-grant execute on function public.create_pair_with_invite_hash(text, text, text) to authenticated;
+grant execute on function public.create_pair_with_invite_hash(text, text, text, text) to authenticated;
 grant execute on function public.join_pair_with_invite_hash(text, text) to authenticated;
 grant execute on function public.regenerate_pair_invite_hash(uuid, text) to authenticated;
