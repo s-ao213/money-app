@@ -43,7 +43,25 @@ export async function POST(request: NextRequest) {
   });
 
   if (error) return jsonError(error.message, 400);
-  return jsonOk({ created: true }, { status: 201 });
+
+  const { data: memberships, error: memberError } = await auth.supabase
+    .from("pair_members")
+    .select("pair_id")
+    .eq("user_id", auth.user.id)
+    .limit(1);
+  if (memberError) return jsonError(memberError.message, 400);
+
+  const pairId = memberships?.[0]?.pair_id || null;
+  if (!pairId) return jsonOk({ pair_id: null, pair: null, members: [] }, { status: 201 });
+
+  const [{ data: pair, error: pairError }, { data: members, error: membersError }] = await Promise.all([
+    auth.supabase.from("pairs").select("id, name, icon_url").eq("id", pairId).maybeSingle(),
+    auth.supabase.from("pair_member_profiles").select("user_id, display_name").eq("pair_id", pairId),
+  ]);
+
+  if (pairError) return jsonError(pairError.message, 400);
+  if (membersError) return jsonError(membersError.message, 400);
+  return jsonOk({ pair_id: pairId, pair, members: members || [] }, { status: 201 });
 }
 
 export async function PATCH(request: NextRequest) {

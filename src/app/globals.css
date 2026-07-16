@@ -181,6 +181,19 @@ h1 {
   color: var(--text);
   padding: 0 14px;
   font-weight: 700;
+  transition: transform 120ms ease, opacity 120ms ease, box-shadow 120ms ease;
+}
+
+.button:active,
+.icon-button:active,
+.nav-button:active {
+  transform: translateY(1px) scale(0.98);
+}
+
+.button:disabled,
+.icon-button:disabled {
+  cursor: wait;
+  opacity: 0.58;
 }
 
 .button.primary {

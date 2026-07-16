@@ -423,6 +423,7 @@ function MoneyApp({
   const [categories, setCategories] = useState<PersonalCategory[]>(defaultCategories);
   const [workplaces, setWorkplaces] = useState<Workplace[]>([]);
   const [message, setMessage] = useState("");
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
   const [inviteCode, setInviteCode] = useState("");
   const [joinCode, setJoinCode] = useState("");
   const [pairForm, setPairForm] = useState({ name: "ふたりの家計簿", displayName: "", iconUrl: "" });
@@ -445,6 +446,25 @@ function MoneyApp({
     if (view === "personalIncomeNew") setEntryForm(makeEntryDefaults("income"));
     if (view === "personalExpenseNew") setEntryForm(makeEntryDefaults("expense"));
   }, [view]);
+
+  useEffect(() => {
+    if (view === "subscriptionNew") {
+      setSubscriptionForm({ ...subscriptionDefaults, is_shared: Boolean(pairId) });
+    }
+  }, [pairId, view]);
+
+  function markPending(action: string, label: string) {
+    setPendingAction(action);
+    setMessage(`${label}中...`);
+  }
+
+  function clearPending(action: string) {
+    setPendingAction((current) => (current === action ? null : current));
+  }
+
+  function buttonLabel(action: string, idle: string, busy = "処理中...") {
+    return pendingAction === action ? busy : idle;
+  }
 
   function personId(person: Person) {
     if (person === "me") return user.id;
@@ -482,6 +502,7 @@ function MoneyApp({
     const profile = await apiRequest<{ display_name: string; avatar_url: string | null }>("/api/profile");
     setDisplayName(profile?.display_name || "");
     setProfileAvatarUrl(profile?.avatar_url || "");
+    const cachedPairId = window.localStorage.getItem(`money-app:${user.id}:pair-id`);
 
     try {
       const personalEntries = await apiRequest<PersonalEntry[]>(`/api/personal/entries`);
@@ -505,7 +526,10 @@ function MoneyApp({
     }
 
     const pairState = await apiRequest<PairApiState>("/api/pair");
-    const nextPairId = pairState.pair_id;
+    const nextPairId = pairState.pair_id || pairId || cachedPairId || null;
+    if (pairState.pair_id) {
+      window.localStorage.setItem(`money-app:${user.id}:pair-id`, pairState.pair_id);
+    }
     setPairId(nextPairId);
 
     try {
@@ -516,6 +540,7 @@ function MoneyApp({
     }
 
     if (!nextPairId) {
+      window.localStorage.removeItem(`money-app:${user.id}:pair-id`);
       setMembers([]);
       setLoans([]);
       setPairInfo(null);
@@ -531,19 +556,31 @@ function MoneyApp({
       setMessage(error instanceof Error ? error.message : "貸し借りを読み込めませんでした。");
     }
 
-    setPairInfo(currentPair as PairInfo | null);
+    if (currentPair) setPairInfo(currentPair as PairInfo);
+    if (pairMembers.length) setMembers(pairMembers as PairMember[]);
     setPairForm({
-      name: currentPair?.name || "ふたりの家計簿",
-      displayName: pairMembers?.find((member) => member.user_id === user.id)?.display_name || profile?.display_name || "",
-      iconUrl: currentPair?.icon_url || "",
+      name: currentPair?.name || pairInfo?.name || "ふたりの家計簿",
+      displayName: pairMembers?.find((member) => member.user_id === user.id)?.display_name || pairForm.displayName || profile?.display_name || "",
+      iconUrl: currentPair?.icon_url || pairInfo?.icon_url || "",
     });
-    setMembers(pairMembers as PairMember[]);
   }
 
   useEffect(() => {
     void refreshAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  async function refreshWithPending() {
+    markPending("refreshAll", "更新");
+    try {
+      await refreshAll();
+      setMessage("最新の状態に更新しました。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "更新できませんでした。");
+    } finally {
+      clearPending("refreshAll");
+    }
+  }
 
   useEffect(() => {
     if (!subscriptions.length && !loans.length) return;
@@ -659,6 +696,7 @@ function MoneyApp({
 
   async function saveProfile() {
     if (!displayName.trim()) return;
+    markPending("saveProfile", "プロフィールを保存");
     try {
       await apiRequest("/api/profile", {
         method: "PATCH",
@@ -668,6 +706,8 @@ function MoneyApp({
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "プロフィールを保存できませんでした。");
+    } finally {
+      clearPending("saveProfile");
     }
   }
 
@@ -677,6 +717,7 @@ function MoneyApp({
       setMessage("ペア名とペア内の表示名を入力してください。");
       return;
     }
+    markPending("savePairSettings", "ペア設定を保存");
     try {
       await apiRequest("/api/pair", {
         method: "PATCH",
@@ -686,6 +727,8 @@ function MoneyApp({
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "ペア設定を保存できませんでした。");
+    } finally {
+      clearPending("savePairSettings");
     }
   }
 
@@ -699,6 +742,7 @@ function MoneyApp({
       setMessage("勤務先を入力してください。");
       return;
     }
+    markPending("saveWorkplace", editingWorkplaceId ? "勤務先を更新" : "勤務先を追加");
     const payload = {
       name: workplaceForm.name.trim(),
       payday_day: workplaceForm.payday_is_month_end ? null : workplaceForm.payday_day,
@@ -715,17 +759,22 @@ function MoneyApp({
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "勤務先を保存できませんでした。");
+    } finally {
+      clearPending("saveWorkplace");
     }
   }
 
   async function deleteWorkplace(id: string) {
     if (!window.confirm("この勤務先を本当に削除しますか？")) return;
+    markPending(`deleteWorkplace:${id}`, "勤務先を削除");
     try {
       await apiRequest<{ id: string }>(`/api/workplaces/${id}`, { method: "DELETE" });
       setMessage("勤務先を削除しました。");
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "勤務先を削除できませんでした。");
+    } finally {
+      clearPending(`deleteWorkplace:${id}`);
     }
   }
 
@@ -738,16 +787,25 @@ function MoneyApp({
     }
     const code = makeInviteCode();
     const codeHash = await sha256(code);
+    markPending("createPair", "ペアを作成");
     try {
-      await apiRequest("/api/pair", {
+      const createdPair = await apiRequest<PairApiState>("/api/pair", {
         method: "POST",
         body: JSON.stringify({ pair_name: nameForPair, invite_hash: codeHash, display_name: nameForMe, icon_url: pairForm.iconUrl || null }),
       });
+      if (createdPair.pair_id) {
+        window.localStorage.setItem(`money-app:${user.id}:pair-id`, createdPair.pair_id);
+        setPairId(createdPair.pair_id);
+      }
+      if (createdPair.pair) setPairInfo(createdPair.pair);
+      if (createdPair.members.length) setMembers(createdPair.members);
       setInviteCode(code);
       setMessage("ペアを作成しました。");
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "ペアを作成できませんでした。");
+    } finally {
+      clearPending("createPair");
     }
   }
 
@@ -755,6 +813,7 @@ function MoneyApp({
     if (!pairId || partner) return;
     const code = makeInviteCode();
     const codeHash = await sha256(code);
+    markPending("regenerateInvite", "招待コードを発行");
     try {
       await apiRequest("/api/pair/invite", {
         method: "PATCH",
@@ -764,6 +823,8 @@ function MoneyApp({
       setMessage("新しい招待コードを発行しました。");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "招待コードを発行できませんでした。");
+    } finally {
+      clearPending("regenerateInvite");
     }
   }
 
@@ -773,6 +834,7 @@ function MoneyApp({
       return;
     }
     const codeHash = await sha256(joinCode.trim().toUpperCase());
+    markPending("joinPair", "ペアに参加");
     try {
       await apiRequest("/api/pair/join", {
         method: "POST",
@@ -783,6 +845,8 @@ function MoneyApp({
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "ペアに参加できませんでした。");
+    } finally {
+      clearPending("joinPair");
     }
   }
 
@@ -816,6 +880,7 @@ function MoneyApp({
       setMessage("共有サブスクは先にペアを作成してください。");
       return;
     }
+    markPending("addSubscription", "サブスクを登録");
     try {
       await apiRequest<Subscription>("/api/subscriptions", {
         method: "POST",
@@ -824,6 +889,8 @@ function MoneyApp({
       window.location.href = "/subscriptions";
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "サブスクを登録できませんでした。");
+    } finally {
+      clearPending("addSubscription");
     }
   }
 
@@ -833,6 +900,7 @@ function MoneyApp({
       setMessage("サブスク名と金額を入力してください。");
       return;
     }
+    markPending("updateSubscription", "サブスクを更新");
     try {
       await apiRequest<Subscription>(`/api/subscriptions/${selectedSubscription.id}`, {
         method: "PATCH",
@@ -842,12 +910,15 @@ function MoneyApp({
       window.location.href = `/subscriptions/${selectedSubscription.id}`;
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "サブスクを更新できませんでした。");
+    } finally {
+      clearPending("updateSubscription");
     }
   }
 
   async function deleteSubscription(subscriptionIdToDelete: string) {
     if (!window.confirm("このサブスクを停止しますか？")) return;
     const stopNextMonth = window.confirm("来月分から停止しますか？\nOK: 来月分から停止\nキャンセル: 今月分から停止");
+    markPending(`deleteSubscription:${subscriptionIdToDelete}`, "サブスクを停止");
     try {
       await apiRequest<Subscription>(`/api/subscriptions/${subscriptionIdToDelete}`, {
         method: "DELETE",
@@ -857,6 +928,8 @@ function MoneyApp({
       window.location.href = "/subscriptions";
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "サブスクを停止できませんでした。");
+    } finally {
+      clearPending(`deleteSubscription:${subscriptionIdToDelete}`);
     }
   }
 
@@ -864,6 +937,7 @@ function MoneyApp({
     if (!pairId || !loanForm.title.trim() || loanForm.principal_amount <= 0) return;
     const lenderId = personId(loanForm.lender);
     const borrowerId = loanForm.lender === "me" ? personId("partner") : user.id;
+    markPending("addLoan", "貸し借りを登録");
     try {
       await apiRequest<Loan>("/api/loans", {
         method: "POST",
@@ -877,6 +951,8 @@ function MoneyApp({
       window.location.href = "/loans";
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "貸し借りを登録できませんでした。");
+    } finally {
+      clearPending("addLoan");
     }
   }
 
@@ -886,6 +962,7 @@ function MoneyApp({
       setMessage("貸し借り名と金額を入力してください。");
       return;
     }
+    markPending("updateLoan", "貸し借りを更新");
     try {
       await apiRequest<Loan>(`/api/loans/${selectedLoan.id}`, {
         method: "PATCH",
@@ -895,17 +972,22 @@ function MoneyApp({
       window.location.href = `/loans/${selectedLoan.id}`;
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "貸し借りを更新できませんでした。");
+    } finally {
+      clearPending("updateLoan");
     }
   }
 
   async function deleteLoan(loanIdToDelete: string) {
     if (!window.confirm("この貸し借りを本当に削除しますか？")) return;
+    markPending(`deleteLoan:${loanIdToDelete}`, "貸し借りを削除");
     try {
       await apiRequest<{ id: string }>(`/api/loans/${loanIdToDelete}`, { method: "DELETE" });
       setMessage("貸し借りを削除しました。");
       window.location.href = "/loans";
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "貸し借りを削除できませんでした。");
+    } finally {
+      clearPending(`deleteLoan:${loanIdToDelete}`);
     }
   }
 
@@ -924,6 +1006,7 @@ function MoneyApp({
       return;
     }
     const paidAt = draft.paid_at || new Date().toISOString().slice(0, 10);
+    markPending(`addRepayment:${loanId}`, "返済を登録");
     try {
       await apiRequest<Repayment>(`/api/loans/${loanId}/repayments`, {
         method: "POST",
@@ -935,6 +1018,8 @@ function MoneyApp({
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "返済を登録できませんでした。");
+    } finally {
+      clearPending(`addRepayment:${loanId}`);
     }
   }
 
@@ -943,6 +1028,7 @@ function MoneyApp({
       setMessage("名前と金額を入力してください。");
       return;
     }
+    markPending("addEntry", "収支を登録");
     try {
       await apiRequest<PersonalEntry>("/api/personal/entries", {
         method: "POST",
@@ -951,6 +1037,8 @@ function MoneyApp({
       window.location.href = "/personal";
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "収支を登録できませんでした。");
+    } finally {
+      clearPending("addEntry");
     }
   }
 
@@ -959,6 +1047,7 @@ function MoneyApp({
       setMessage("名前と金額を入力してください。");
       return;
     }
+    markPending(`updateEntry:${entryIdToUpdate}`, "収支を更新");
     try {
       await apiRequest<PersonalEntry>(`/api/personal/entries/${entryIdToUpdate}`, {
         method: "PATCH",
@@ -969,17 +1058,22 @@ function MoneyApp({
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "収支を更新できませんでした。");
+    } finally {
+      clearPending(`updateEntry:${entryIdToUpdate}`);
     }
   }
 
   async function deleteEntry(entryIdToDelete: string) {
     if (!window.confirm("この収支を本当に削除しますか？")) return;
+    markPending(`deleteEntry:${entryIdToDelete}`, "収支を削除");
     try {
       await apiRequest<{ id: string }>(`/api/personal/entries/${entryIdToDelete}`, { method: "DELETE" });
       setMessage("収支を削除しました。");
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "収支を削除できませんでした。");
+    } finally {
+      clearPending(`deleteEntry:${entryIdToDelete}`);
     }
   }
 
@@ -1103,6 +1197,7 @@ function MoneyApp({
       setMessage("カテゴリ名を入力してください。");
       return;
     }
+    markPending("addCategory", "カテゴリを追加");
     try {
       await apiRequest<PersonalCategory>("/api/personal/categories", {
         method: "POST",
@@ -1113,6 +1208,8 @@ function MoneyApp({
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "カテゴリを追加できませんでした。");
+    } finally {
+      clearPending("addCategory");
     }
   }
 
@@ -1121,6 +1218,7 @@ function MoneyApp({
       setMessage("カテゴリ名を入力してください。");
       return;
     }
+    markPending(`updateCategory:${category.id}`, "カテゴリを更新");
     try {
       await apiRequest<PersonalCategory>(`/api/personal/categories/${category.id}`, {
         method: "PATCH",
@@ -1132,17 +1230,22 @@ function MoneyApp({
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "カテゴリを更新できませんでした。");
+    } finally {
+      clearPending(`updateCategory:${category.id}`);
     }
   }
 
   async function deleteCategory(category: PersonalCategory) {
     if (!window.confirm("このカテゴリを本当に削除しますか？")) return;
+    markPending(`deleteCategory:${category.id}`, "カテゴリを削除");
     try {
       await apiRequest<{ id: string }>(`/api/personal/categories/${category.id}`, { method: "DELETE" });
       setMessage("カテゴリを削除しました。");
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "カテゴリを削除できませんでした。");
+    } finally {
+      clearPending(`deleteCategory:${category.id}`);
     }
   }
 
@@ -1187,7 +1290,7 @@ function MoneyApp({
 
         <nav className="nav" onClick={() => setMenuOpen(false)}>
           <NavButton icon={<PieChart />} label="ダッシュボード" href="/" active={view === "dashboard"} />
-          <NavButton icon={<RefreshCcw />} label="サブスク" href="/subscriptions" active={view.startsWith("subscription")} disabled={!pairId} />
+          <NavButton icon={<RefreshCcw />} label="サブスク" href="/subscriptions" active={view.startsWith("subscription")} />
           {pairId && <NavButton icon={<HandCoins />} label="貸し借り" href="/loans" active={view.startsWith("loan")} />}
           <NavButton icon={<Banknote />} label="個人収支" href="/personal" active={view.startsWith("personal")} />
           <NavButton icon={<UserRound />} label="Myページ" href="/my-page" active={view === "myPage"} />
@@ -1201,9 +1304,9 @@ function MoneyApp({
             <span>対象月</span>
             <input className="month-input" type="month" value={selectedMonth} onChange={(event) => setSelectedMonth(event.target.value)} />
           </label>
-          <button className="button ghost" onClick={() => refreshAll()}>
+          <button className="button ghost" onClick={() => refreshWithPending()} disabled={Boolean(pendingAction)}>
             <RefreshCcw size={16} />
-            更新
+            {buttonLabel("refreshAll", "更新", "更新中...")}
           </button>
         </div>
 
@@ -1240,6 +1343,8 @@ function MoneyApp({
             selfName={selfName}
             partnerName={partnerName}
             onSubmit={addSubscription}
+            disabled={Boolean(pendingAction)}
+            submitLabel={buttonLabel("addSubscription", "登録する", "登録中...")}
           />
         )}
 
@@ -1261,7 +1366,8 @@ function MoneyApp({
             partnerName={partnerName}
             onSubmit={updateSubscription}
             title="サブスク編集"
-            submitLabel="更新する"
+            submitLabel={buttonLabel("updateSubscription", "更新する", "更新中...")}
+            disabled={Boolean(pendingAction)}
           />
         )}
 
@@ -1280,7 +1386,15 @@ function MoneyApp({
         )}
 
         {view === "loanNew" && (
-          <LoanFormView form={loanForm} setForm={setLoanForm} selfName={selfName} partnerName={partnerName} onSubmit={addLoan} />
+          <LoanFormView
+            form={loanForm}
+            setForm={setLoanForm}
+            selfName={selfName}
+            partnerName={partnerName}
+            onSubmit={addLoan}
+            submitLabel={buttonLabel("addLoan", "登録する", "登録中...")}
+            disabled={Boolean(pendingAction)}
+          />
         )}
 
         {view === "loanDetail" && (
@@ -1305,7 +1419,8 @@ function MoneyApp({
             partnerName={partnerName}
             onSubmit={updateLoan}
             title="貸し借り編集"
-            submitLabel="更新する"
+            submitLabel={buttonLabel("updateLoan", "更新する", "更新中...")}
+            disabled={Boolean(pendingAction)}
           />
         )}
 
@@ -1326,7 +1441,7 @@ function MoneyApp({
         )}
 
         {(view === "personalIncomeNew" || view === "personalExpenseNew") && (
-          <PersonalEntryFormView form={entryForm} setForm={setEntryForm} categories={categories} onSubmit={addEntry} />
+          <PersonalEntryFormView form={entryForm} setForm={setEntryForm} categories={categories} onSubmit={addEntry} submitLabel={buttonLabel("addEntry", "登録する", "登録中...")} disabled={Boolean(pendingAction)} />
         )}
 
         {view === "personalCategoryNew" && (
@@ -1342,6 +1457,8 @@ function MoneyApp({
             onSubmit={addCategory}
             updateCategory={updateCategory}
             deleteCategory={deleteCategory}
+            pendingAction={pendingAction}
+            buttonLabel={buttonLabel}
           />
         )}
 
@@ -1380,6 +1497,8 @@ function MoneyApp({
             saveWorkplace={saveWorkplace}
             deleteWorkplace={deleteWorkplace}
             resetWorkplaceForm={resetWorkplaceForm}
+            pendingAction={pendingAction}
+            buttonLabel={buttonLabel}
           />
         )}
       </section>
@@ -1568,6 +1687,7 @@ function SubscriptionFormView({
   onSubmit,
   title = "サブスク追加",
   submitLabel = "登録する",
+  disabled = false,
 }: {
   form: typeof subscriptionDefaults;
   setForm: (form: typeof subscriptionDefaults) => void;
@@ -1576,6 +1696,7 @@ function SubscriptionFormView({
   onSubmit: () => void;
   title?: string;
   submitLabel?: string;
+  disabled?: boolean;
 }) {
   return (
     <section className="view">
@@ -1632,7 +1753,7 @@ function SubscriptionFormView({
           )}
           <TextField label="メモ" unit="任意" value={form.memo} onChange={(value) => setForm({ ...form, memo: value })} />
         </div>
-        <button className="button primary form-submit" onClick={onSubmit}>{submitLabel}</button>
+        <button className="button primary form-submit" onClick={onSubmit} disabled={disabled}>{submitLabel}</button>
       </Panel>
     </section>
   );
@@ -1783,6 +1904,7 @@ function LoanFormView({
   onSubmit,
   title = "貸し借り追加",
   submitLabel = "登録する",
+  disabled = false,
 }: {
   form: typeof loanDefaults;
   setForm: (form: typeof loanDefaults) => void;
@@ -1791,6 +1913,7 @@ function LoanFormView({
   onSubmit: () => void;
   title?: string;
   submitLabel?: string;
+  disabled?: boolean;
 }) {
   return (
     <section className="view">
@@ -1809,7 +1932,7 @@ function LoanFormView({
           {form.repayment_day_mode === "day" && <NumberField label="返済予定日" unit="日" value={form.repayment_day} onChange={(value) => setForm({ ...form, repayment_day: value })} />}
           <TextField label="メモ" unit="任意" value={form.memo} onChange={(value) => setForm({ ...form, memo: value })} />
         </div>
-        <button className="button primary form-submit" onClick={onSubmit}>{submitLabel}</button>
+        <button className="button primary form-submit" onClick={onSubmit} disabled={disabled}>{submitLabel}</button>
       </Panel>
     </section>
   );
@@ -1911,11 +2034,15 @@ function PersonalEntryFormView({
   setForm,
   categories,
   onSubmit,
+  submitLabel = "登録する",
+  disabled = false,
 }: {
   form: ReturnType<typeof makeEntryDefaults>;
   setForm: (form: ReturnType<typeof makeEntryDefaults>) => void;
   categories: PersonalCategory[];
   onSubmit: () => void;
+  submitLabel?: string;
+  disabled?: boolean;
 }) {
   const options = categories.filter((category) => category.type === form.type).map((category) => [category.name, category.name] as [string, string]);
   return (
@@ -1923,7 +2050,7 @@ function PersonalEntryFormView({
       <PageHead title={form.type === "income" ? "収入追加" : "支出追加"} backHref="/personal" />
       <Panel title="内容">
         <PersonalEntryFields form={form} setForm={setForm} categories={categories} />
-        <button className="button primary form-submit" onClick={onSubmit}>登録する</button>
+        <button className="button primary form-submit" onClick={onSubmit} disabled={disabled}>{submitLabel}</button>
       </Panel>
     </section>
   );
@@ -1962,6 +2089,8 @@ function CategoryFormView({
   onSubmit,
   updateCategory,
   deleteCategory,
+  pendingAction,
+  buttonLabel,
 }: {
   form: { type: MoneyType; name: string };
   setForm: (form: { type: MoneyType; name: string }) => void;
@@ -1974,6 +2103,8 @@ function CategoryFormView({
   onSubmit: () => void;
   updateCategory: (category: PersonalCategory) => void;
   deleteCategory: (category: PersonalCategory) => void;
+  pendingAction: string | null;
+  buttonLabel: (action: string, idle: string, busy?: string) => string;
 }) {
   return (
     <section className="view">
@@ -1983,7 +2114,9 @@ function CategoryFormView({
           <SelectField label="種類" value={form.type} onChange={(value) => setForm({ ...form, type: value as MoneyType })} options={[["income", "収入"], ["expense", "支出"]]} />
           <TextField label="カテゴリ名" unit="文字" value={form.name} onChange={(value) => setForm({ ...form, name: value })} />
         </div>
-        <button className="button primary form-submit" onClick={onSubmit}>追加する</button>
+        <button className="button primary form-submit" onClick={onSubmit} disabled={Boolean(pendingAction)}>
+          {buttonLabel("addCategory", "追加する", "追加中...")}
+        </button>
       </Panel>
 
       <Panel title="登録済みカテゴリ">
@@ -2004,13 +2137,13 @@ function CategoryFormView({
                 <div className="icon-actions">
                   {editingCategoryId === category.id ? (
                     <>
-                      <button className="icon-button" aria-label="カテゴリを保存" title="保存" onClick={() => updateCategory(category)}><Save size={18} /></button>
+                      <button className="icon-button" aria-label="カテゴリを保存" title="保存" disabled={Boolean(pendingAction)} onClick={() => updateCategory(category)}><Save size={18} /></button>
                       <button className="icon-button" aria-label="編集をキャンセル" title="キャンセル" onClick={() => setEditingCategoryId(null)}><X size={18} /></button>
                     </>
                   ) : (
                     <>
                       <button className="icon-button" aria-label="カテゴリを編集" title="編集" onClick={() => { setEditingCategoryId(category.id); setEditingCategoryName(category.name); }}><Pencil size={18} /></button>
-                      <button className="icon-button danger-icon" aria-label="カテゴリを削除" title="削除" onClick={() => deleteCategory(category)}><Trash2 size={18} /></button>
+                      <button className="icon-button danger-icon" aria-label="カテゴリを削除" title="削除" disabled={Boolean(pendingAction)} onClick={() => deleteCategory(category)}><Trash2 size={18} /></button>
                     </>
                   )}
                 </div>
@@ -2079,6 +2212,8 @@ function MyPageView({
   saveWorkplace,
   deleteWorkplace,
   resetWorkplaceForm,
+  pendingAction,
+  buttonLabel,
 }: {
   user: User;
   displayName: string;
@@ -2111,6 +2246,8 @@ function MyPageView({
   saveWorkplace: () => void;
   deleteWorkplace: (id: string) => void;
   resetWorkplaceForm: () => void;
+  pendingAction: string | null;
+  buttonLabel: (action: string, idle: string, busy?: string) => string;
 }) {
   async function copyInviteCode() {
     if (!inviteCode) return;
@@ -2131,7 +2268,7 @@ function MyPageView({
           <TextField label="表示名" unit="文字" value={displayName} onChange={setDisplayName} />
         </div>
         <div className="button-row">
-          <button className="button primary" onClick={saveProfile}>保存</button>
+          <button className="button primary" onClick={saveProfile} disabled={Boolean(pendingAction)}>{buttonLabel("saveProfile", "保存", "保存中...")}</button>
           <button className="button ghost" onClick={changePassword}><KeyRound size={16} />パスワード変更</button>
           <button className="button danger" onClick={signOut}><LogOut size={16} />ログアウト</button>
         </div>
@@ -2144,7 +2281,7 @@ function MyPageView({
               <ImagePicker label="グループアイコン" imageUrl={pairForm.iconUrl} onChange={(iconUrl) => setPairForm({ ...pairForm, iconUrl })} onMessage={setMessage} />
               <TextField label="ペア名" unit="文字" value={pairForm.name} onChange={(name) => setPairForm({ ...pairForm, name })} />
               <TextField label="ペア内で使用する自分の表示名" unit="文字" value={pairForm.displayName} onChange={(displayNameValue) => setPairForm({ ...pairForm, displayName: displayNameValue })} />
-              <button className="button primary" onClick={savePairSettings}><Save size={16} />ペア設定を保存</button>
+              <button className="button primary" onClick={savePairSettings} disabled={Boolean(pendingAction)}><Save size={16} />{buttonLabel("savePairSettings", "ペア設定を保存", "保存中...")}</button>
             </div>
             <div className="member-list">
               {members.map((member) => (
@@ -2158,7 +2295,7 @@ function MyPageView({
             {!partner && (
               <>
                 <div className="button-row">
-                  <button className="button primary" onClick={regenerateInvite}>招待コードを発行</button>
+                  <button className="button primary" onClick={regenerateInvite} disabled={Boolean(pendingAction)}>{buttonLabel("regenerateInvite", "招待コードを発行", "発行中...")}</button>
                   {inviteCode && <button className="button ghost" onClick={copyInviteCode}><Copy size={16} />コピー</button>}
                 </div>
                 {inviteCode && <div className="invite-code">{inviteCode}</div>}
@@ -2173,12 +2310,12 @@ function MyPageView({
               <TextField label="ペア内で使用する自分の表示名" unit="文字" value={pairForm.displayName} onChange={(displayNameValue) => setPairForm({ ...pairForm, displayName: displayNameValue })} />
             </div>
             <div className="button-row">
-              <button className="button primary" onClick={createPair}>ペアを作成</button>
+              <button className="button primary" onClick={createPair} disabled={Boolean(pendingAction)}>{buttonLabel("createPair", "ペアを作成", "作成中...")}</button>
             </div>
             {inviteCode && <div className="invite-code">{inviteCode}</div>}
             <div className="stack-form join-form">
               <TextField label="招待コード" value={joinCode} onChange={(value) => setJoinCode(value.toUpperCase())} />
-              <button className="button dark" onClick={joinPair}>ペアに参加</button>
+              <button className="button dark" onClick={joinPair} disabled={Boolean(pendingAction)}>{buttonLabel("joinPair", "ペアに参加", "参加中...")}</button>
             </div>
           </>
         )}
@@ -2200,7 +2337,7 @@ function MyPageView({
           )}
         </div>
         <div className="button-row">
-          <button className="button primary" onClick={saveWorkplace}>{editingWorkplaceId ? "更新する" : "追加する"}</button>
+          <button className="button primary" onClick={saveWorkplace} disabled={Boolean(pendingAction)}>{buttonLabel("saveWorkplace", editingWorkplaceId ? "更新する" : "追加する", editingWorkplaceId ? "更新中..." : "追加中...")}</button>
           {editingWorkplaceId && <button className="button ghost" onClick={resetWorkplaceForm}>キャンセル</button>}
         </div>
         <div className="ledger-list workplace-list">
@@ -2227,7 +2364,7 @@ function MyPageView({
                 >
                   <Pencil size={18} />
                 </button>
-                <button className="icon-button danger-icon" aria-label="勤務先を削除" title="削除" onClick={() => deleteWorkplace(workplace.id)}>
+                <button className="icon-button danger-icon" aria-label="勤務先を削除" title="削除" disabled={Boolean(pendingAction)} onClick={() => deleteWorkplace(workplace.id)}>
                   <Trash2 size={18} />
                 </button>
               </div>
