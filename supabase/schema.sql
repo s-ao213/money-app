@@ -29,16 +29,25 @@ create table if not exists public.pair_members (
 
 create table if not exists public.subscriptions (
   id uuid primary key default gen_random_uuid(),
-  pair_id uuid not null references public.pairs(id) on delete cascade,
+  pair_id uuid references public.pairs(id) on delete cascade,
+  created_by uuid not null default auth.uid() references auth.users(id) on delete cascade,
   name text not null,
+  is_shared boolean not null default true,
   owner_user_id uuid not null references auth.users(id) on delete cascade,
+  payer_user_id uuid not null references auth.users(id) on delete cascade,
   amount integer not null check (amount >= 0),
-  billing_cycle text not null check (billing_cycle in ('monthly', 'yearly')),
+  billing_cycle text not null check (billing_cycle in ('weekly', 'monthly', 'yearly')),
+  renewal_day integer not null default 1 check (renewal_day between 1 and 31),
+  renewal_month integer not null default 1 check (renewal_month between 1 and 12),
+  renewal_weekday integer not null default 1 check (renewal_weekday between 0 and 6),
   billing_day integer not null check (billing_day between 1 and 31),
   billing_month integer not null default 1 check (billing_month between 1 and 12),
+  billing_weekday integer not null default 1 check (billing_weekday between 0 and 6),
   share_type text not null check (share_type in ('percentage', 'fixed')),
   partner_share_value integer not null default 0 check (partner_share_value >= 0),
-  status text not null default 'active' check (status in ('active', 'paused')),
+  status text not null default 'active' check (status in ('active', 'paused', 'ended')),
+  stop_billing_from date,
+  memo text not null default '',
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -56,6 +65,9 @@ create table if not exists public.loans (
   installment_count integer not null default 1 check (installment_count >= 1),
   monthly_amount integer not null default 0 check (monthly_amount >= 0),
   repayment_day integer not null default 25 check (repayment_day between 1 and 31),
+  repayment_day_mode text not null default 'day' check (repayment_day_mode in ('day', 'payday')),
+  repayment_workplace_id uuid references public.workplaces(id) on delete set null,
+  memo text not null default '',
   status text not null default 'active' check (status in ('active', 'paid', 'overdue', 'canceled')),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
@@ -75,11 +87,17 @@ create table if not exists public.personal_entries (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references auth.users(id) on delete cascade,
   type text not null check (type in ('income', 'expense')),
+  entry_status text not null default 'confirmed' check (entry_status in ('planned', 'confirmed')),
   title text not null,
   amount integer not null check (amount >= 0),
   entry_date date not null,
   category text not null default 'その他',
   source text not null default '',
+  source_type text not null default 'manual' check (source_type in ('manual', 'subscription', 'loan', 'repayment')),
+  source_id uuid,
+  period_key text,
+  scheduled_date date,
+  excluded_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
@@ -108,6 +126,29 @@ create table if not exists public.workplaces (
 alter table public.profiles add column if not exists avatar_url text;
 alter table public.pairs add column if not exists icon_url text;
 alter table public.pair_members add column if not exists display_name text not null default '';
+alter table public.subscriptions alter column pair_id drop not null;
+alter table public.subscriptions add column if not exists created_by uuid default auth.uid() references auth.users(id) on delete cascade;
+alter table public.subscriptions add column if not exists is_shared boolean not null default true;
+alter table public.subscriptions add column if not exists payer_user_id uuid references auth.users(id) on delete cascade;
+alter table public.subscriptions add column if not exists renewal_day integer not null default 1;
+alter table public.subscriptions add column if not exists renewal_month integer not null default 1;
+alter table public.subscriptions add column if not exists renewal_weekday integer not null default 1;
+alter table public.subscriptions add column if not exists billing_weekday integer not null default 1;
+alter table public.subscriptions add column if not exists stop_billing_from date;
+alter table public.subscriptions add column if not exists memo text not null default '';
+update public.subscriptions set created_by = owner_user_id where created_by is null;
+update public.subscriptions set payer_user_id = owner_user_id where payer_user_id is null;
+alter table public.subscriptions alter column created_by set not null;
+alter table public.subscriptions alter column payer_user_id set not null;
+alter table public.loans add column if not exists repayment_day_mode text not null default 'day';
+alter table public.loans add column if not exists repayment_workplace_id uuid references public.workplaces(id) on delete set null;
+alter table public.loans add column if not exists memo text not null default '';
+alter table public.personal_entries add column if not exists entry_status text not null default 'confirmed';
+alter table public.personal_entries add column if not exists source_type text not null default 'manual';
+alter table public.personal_entries add column if not exists source_id uuid;
+alter table public.personal_entries add column if not exists period_key text;
+alter table public.personal_entries add column if not exists scheduled_date date;
+alter table public.personal_entries add column if not exists excluded_at timestamptz;
 
 create unique index if not exists personal_categories_private_name_unique
 on public.personal_categories (user_id, type, name)
@@ -116,6 +157,10 @@ where pair_id is null;
 create unique index if not exists personal_categories_shared_name_unique
 on public.personal_categories (pair_id, type, name)
 where pair_id is not null;
+
+create unique index if not exists personal_entries_generated_unique
+on public.personal_entries (user_id, source_type, source_id, period_key, scheduled_date)
+where source_type <> 'manual' and source_id is not null and period_key is not null and scheduled_date is not null;
 
 create or replace function public.touch_updated_at()
 returns trigger
@@ -348,21 +393,52 @@ with check (user_id = auth.uid());
 
 drop policy if exists "subscriptions member select" on public.subscriptions;
 create policy "subscriptions member select" on public.subscriptions
-for select using (public.is_pair_member(pair_id));
+for select using (
+  (is_shared = false and created_by = auth.uid())
+  or (is_shared = true and pair_id is not null and public.is_pair_member(pair_id))
+);
 
 drop policy if exists "subscriptions member insert" on public.subscriptions;
 create policy "subscriptions member insert" on public.subscriptions
 for insert with check (
-  public.is_pair_member(pair_id)
-  and public.is_user_in_pair(pair_id, owner_user_id)
+  created_by = auth.uid()
+  and (
+    (is_shared = false and pair_id is null and owner_user_id = auth.uid() and payer_user_id = auth.uid())
+    or (
+      is_shared = true
+      and pair_id is not null
+      and public.is_pair_member(pair_id)
+      and public.is_user_in_pair(pair_id, owner_user_id)
+      and public.is_user_in_pair(pair_id, payer_user_id)
+    )
+  )
 );
 
 drop policy if exists "subscriptions member update" on public.subscriptions;
 create policy "subscriptions member update" on public.subscriptions
-for update using (public.is_pair_member(pair_id))
+for update using (
+  (is_shared = false and created_by = auth.uid())
+  or (is_shared = true and pair_id is not null and public.is_pair_member(pair_id))
+)
 with check (
-  public.is_pair_member(pair_id)
-  and public.is_user_in_pair(pair_id, owner_user_id)
+  created_by = auth.uid()
+  and (
+    (is_shared = false and pair_id is null and owner_user_id = auth.uid() and payer_user_id = auth.uid())
+    or (
+      is_shared = true
+      and pair_id is not null
+      and public.is_pair_member(pair_id)
+      and public.is_user_in_pair(pair_id, owner_user_id)
+      and public.is_user_in_pair(pair_id, payer_user_id)
+    )
+  )
+);
+
+drop policy if exists "subscriptions member delete" on public.subscriptions;
+create policy "subscriptions member delete" on public.subscriptions
+for delete using (
+  (is_shared = false and created_by = auth.uid())
+  or (is_shared = true and pair_id is not null and public.is_pair_member(pair_id))
 );
 
 drop policy if exists "loans member select" on public.loans;
@@ -379,12 +455,17 @@ for insert with check (
 
 drop policy if exists "loans member update" on public.loans;
 create policy "loans member update" on public.loans
-for update using (public.is_pair_member(pair_id))
+for update using (public.is_pair_member(pair_id) and lender_user_id = auth.uid())
 with check (
   public.is_pair_member(pair_id)
+  and lender_user_id = auth.uid()
   and public.is_user_in_pair(pair_id, lender_user_id)
   and public.is_user_in_pair(pair_id, borrower_user_id)
 );
+
+drop policy if exists "loans lender delete" on public.loans;
+create policy "loans lender delete" on public.loans
+for delete using (public.is_pair_member(pair_id) and lender_user_id = auth.uid());
 
 drop policy if exists "loan_repayments member select" on public.loan_repayments;
 create policy "loan_repayments member select" on public.loan_repayments
@@ -400,7 +481,7 @@ create policy "loan_repayments member insert" on public.loan_repayments
 for insert with check (
   exists (
     select 1 from public.loans l
-    where l.id = loan_id and public.is_pair_member(l.pair_id)
+    where l.id = loan_id and public.is_pair_member(l.pair_id) and l.lender_user_id = auth.uid()
   )
 );
 

@@ -33,11 +33,13 @@ import {
 import * as XLSX from "xlsx";
 
 type Person = "me" | "partner";
-type BillingCycle = "monthly" | "yearly";
+type BillingCycle = "weekly" | "monthly" | "yearly";
 type BillingDayMode = "day" | "end_of_month" | "payday";
 type ShareType = "percentage" | "fixed";
 type RepaymentType = "lump_sum" | "installment" | "flexible";
 type MoneyType = "income" | "expense";
+type EntryStatus = "planned" | "confirmed";
+type SourceType = "manual" | "subscription" | "loan" | "repayment";
 
 type PairMember = { user_id: string; display_name: string };
 
@@ -47,18 +49,33 @@ type PairInfo = {
   icon_url: string | null;
 };
 
+type PairApiState = {
+  pair_id: string | null;
+  pair: PairInfo | null;
+  members: PairMember[];
+};
+
 type Subscription = {
   id: string;
-  pair_id: string;
+  pair_id: string | null;
+  created_by: string;
   name: string;
+  is_shared: boolean;
   owner_user_id: string;
+  payer_user_id: string;
   amount: number;
   billing_cycle: BillingCycle;
+  renewal_day: number;
+  renewal_month: number;
+  renewal_weekday: number;
   billing_day: number;
   billing_month: number;
+  billing_weekday: number;
   share_type: ShareType;
   partner_share_value: number;
-  status: "active" | "paused";
+  status: "active" | "paused" | "ended";
+  stop_billing_from: string | null;
+  memo: string;
 };
 
 type Loan = {
@@ -74,6 +91,9 @@ type Loan = {
   installment_count: number;
   monthly_amount: number;
   repayment_day: number;
+  repayment_day_mode: "day" | "payday";
+  repayment_workplace_id: string | null;
+  memo: string;
   status: "active" | "paid" | "overdue" | "canceled";
   loan_repayments: Repayment[];
 };
@@ -90,11 +110,17 @@ type PersonalEntry = {
   id: string;
   user_id: string;
   type: MoneyType;
+  entry_status: EntryStatus;
   title: string;
   amount: number;
   entry_date: string;
   category: string;
   source: string;
+  source_type: SourceType;
+  source_id: string | null;
+  period_key: string | null;
+  scheduled_date: string | null;
+  excluded_at: string | null;
 };
 
 type PersonalCategory = {
@@ -127,9 +153,12 @@ export type AppView =
   | "dashboard"
   | "subscriptions"
   | "subscriptionNew"
+  | "subscriptionDetail"
+  | "subscriptionEdit"
   | "loans"
   | "loanNew"
   | "loanDetail"
+  | "loanEdit"
   | "personal"
   | "personalIncomeNew"
   | "personalExpenseNew"
@@ -155,16 +184,33 @@ const defaultCategories: PersonalCategory[] = [
   { id: "other", type: "expense", name: "その他" },
 ];
 
+const weekdayOptions: [string, string][] = [
+  ["0", "日曜日"],
+  ["1", "月曜日"],
+  ["2", "火曜日"],
+  ["3", "水曜日"],
+  ["4", "木曜日"],
+  ["5", "金曜日"],
+  ["6", "土曜日"],
+];
+
 const subscriptionDefaults = {
   name: "",
+  is_shared: true,
   owner: "me" as Person,
+  payer: "me" as Person,
   amount: 0,
   billing_cycle: "monthly" as BillingCycle,
   billing_day_mode: "day" as BillingDayMode,
+  renewal_day: 1,
+  renewal_month: 1,
+  renewal_weekday: 1,
   billing_day: 1,
   billing_month: 1,
+  billing_weekday: 1,
   share_type: "percentage" as ShareType,
   partner_share_value: 50,
+  memo: "",
 };
 
 const loanDefaults = {
@@ -177,6 +223,9 @@ const loanDefaults = {
   installment_count: 6,
   monthly_amount: 0,
   repayment_day: 25,
+  repayment_day_mode: "day" as "day" | "payday",
+  repayment_workplace_id: "",
+  memo: "",
 };
 
 function makeEntryDefaults(type: MoneyType) {
@@ -187,6 +236,7 @@ function makeEntryDefaults(type: MoneyType) {
     entry_date: `${currentMonth}-01`,
     category: type === "income" ? "給与" : "その他",
     source: "",
+    entry_status: "confirmed" as EntryStatus,
   };
 }
 
@@ -214,6 +264,10 @@ function dateFor(month: string, day: number) {
   return `${month}-${String(Math.min(day, daysInMonth(month))).padStart(2, "0")}`;
 }
 
+function todayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
 function sum(rows: { amount: number }[]) {
   return rows.reduce((total, row) => total + Number(row.amount), 0);
 }
@@ -237,16 +291,58 @@ function ownerShare(subscription: Subscription, owner: Person) {
 
 function subscriptionOccurs(subscription: Subscription, month: string) {
   if (subscription.status !== "active") return false;
+  if (subscription.stop_billing_from && month >= subscription.stop_billing_from.slice(0, 7)) return false;
+  if (subscription.billing_cycle === "weekly") return true;
   if (subscription.billing_cycle === "monthly") return true;
   return Number(month.slice(5, 7)) === subscription.billing_month;
 }
 
+function weekdayDateFor(month: string, weekday: number) {
+  const [year, monthNumber] = month.split("-").map(Number);
+  const first = new Date(year, monthNumber - 1, 1);
+  const offset = (weekday - first.getDay() + 7) % 7;
+  return dateFor(month, 1 + offset);
+}
+
+function paymentDateForSubscription(subscription: Subscription, month: string) {
+  if (subscription.billing_cycle === "weekly") return weekdayDateFor(month, subscription.billing_weekday ?? subscription.renewal_weekday ?? 1);
+  return dateFor(month, subscription.billing_day || subscription.renewal_day || 1);
+}
+
+function periodKeyForSubscription(subscription: Subscription, month: string) {
+  if (subscription.billing_cycle === "yearly") return `${month.slice(0, 4)}`;
+  if (subscription.billing_cycle === "weekly") return paymentDateForSubscription(subscription, month);
+  return month;
+}
+
+function titleForSubscription(subscription: Subscription, month: string) {
+  if (subscription.billing_cycle === "yearly") return `${subscription.name}（${month.slice(0, 4)}年分）`;
+  if (subscription.billing_cycle === "weekly") {
+    const paymentDate = paymentDateForSubscription(subscription, month);
+    return `${subscription.name}（${Number(paymentDate.slice(5, 7))}月${Number(paymentDate.slice(8, 10))}日支払分）`;
+  }
+  return `${subscription.name}（${Number(month.slice(5, 7))}月分）`;
+}
+
+function entryStatusForDate(date: string): EntryStatus {
+  return date <= todayKey() ? "confirmed" : "planned";
+}
+
+function scheduledLoanAmountForIndex(loan: Loan, index: number) {
+  if (loan.repayment_type !== "installment") return loan.principal_amount;
+  const base = Math.floor(loan.principal_amount / loan.installment_count);
+  const remainder = loan.principal_amount % loan.installment_count;
+  return base + (index === loan.installment_count - 1 ? remainder : 0);
+}
+
 export default function CoupleMoneyApp({
   view,
+  subscriptionId,
   entryId,
   loanId,
 }: {
   view: AppView;
+  subscriptionId?: string;
   entryId?: string;
   loanId?: string;
 }) {
@@ -296,19 +392,21 @@ export default function CoupleMoneyApp({
   if (loading) return <FullPageMessage title="読み込み中" body="認証状態を確認しています。" />;
   if (!session) return <AuthScreen supabase={supabase} />;
 
-  return <MoneyApp supabase={supabase} user={session.user} view={view} entryId={entryId} loanId={loanId} />;
+  return <MoneyApp supabase={supabase} user={session.user} view={view} subscriptionId={subscriptionId} entryId={entryId} loanId={loanId} />;
 }
 
 function MoneyApp({
   supabase,
   user,
   view,
+  subscriptionId,
   entryId,
   loanId,
 }: {
   supabase: SupabaseClient;
   user: User;
   view: AppView;
+  subscriptionId?: string;
   entryId?: string;
   loanId?: string;
 }) {
@@ -361,70 +459,77 @@ function MoneyApp({
     return person === "me" ? selfName : partnerName;
   }
 
+  async function apiRequest<T>(path: string, init?: RequestInit) {
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    if (!token) throw new Error("ログインが必要です。");
+
+    const response = await fetch(path, {
+      ...init,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        ...init?.headers,
+      },
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || "API処理に失敗しました。");
+    return payload.data as T;
+  }
+
   async function refreshAll() {
     setMessage("");
-    const { data: profile } = await supabase.from("profiles").select("display_name, avatar_url").eq("id", user.id).maybeSingle();
+    const profile = await apiRequest<{ display_name: string; avatar_url: string | null }>("/api/profile");
     setDisplayName(profile?.display_name || "");
     setProfileAvatarUrl(profile?.avatar_url || "");
 
-    const { data: personalEntries } = await supabase
-      .from("personal_entries")
-      .select("*")
-      .eq("user_id", user.id)
-      .order("entry_date", { ascending: false });
-    setEntries((personalEntries || []) as PersonalEntry[]);
-
-    const { data: savedWorkplaces } = await supabase
-      .from("workplaces")
-      .select("*")
-      .eq("user_id", user.id)
-      .order("created_at", { ascending: false });
-    setWorkplaces((savedWorkplaces || []) as Workplace[]);
-
-    const { data: memberships, error: memberError } = await supabase
-      .from("pair_members")
-      .select("pair_id")
-      .eq("user_id", user.id)
-      .limit(1);
-
-    if (memberError) {
-      setMessage(memberError.message);
-      return;
+    try {
+      const personalEntries = await apiRequest<PersonalEntry[]>(`/api/personal/entries`);
+      setEntries(personalEntries || []);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "個人収支を読み込めませんでした。");
     }
 
-    const nextPairId = memberships?.[0]?.pair_id || null;
+    try {
+      const savedWorkplaces = await apiRequest<Workplace[]>("/api/workplaces");
+      setWorkplaces(savedWorkplaces || []);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "勤務先を読み込めませんでした。");
+    }
+
+    try {
+      const apiSubscriptions = await apiRequest<Subscription[]>("/api/subscriptions");
+      setSubscriptions(apiSubscriptions || []);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "サブスクを読み込めませんでした。");
+    }
+
+    const pairState = await apiRequest<PairApiState>("/api/pair");
+    const nextPairId = pairState.pair_id;
     setPairId(nextPairId);
 
-    let categoriesQuery = supabase
-      .from("personal_categories")
-      .select("id, user_id, pair_id, type, name")
-      .order("name", { ascending: true });
-    if (nextPairId) {
-      categoriesQuery = categoriesQuery.or(`user_id.eq.${user.id},pair_id.eq.${nextPairId}`);
-    } else {
-      categoriesQuery = categoriesQuery.eq("user_id", user.id);
-    }
-    const { data: savedCategories, error: categoryError } = await categoriesQuery;
-    if (categoryError) {
-      setMessage(categoryError.message);
-    } else {
+    try {
+      const savedCategories = await apiRequest<PersonalCategory[]>(`/api/personal/categories${nextPairId ? `?pair_id=${nextPairId}` : ""}`);
       setCategories((savedCategories?.length ? savedCategories : defaultCategories) as PersonalCategory[]);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "カテゴリを読み込めませんでした。");
     }
 
     if (!nextPairId) {
       setMembers([]);
-      setSubscriptions([]);
       setLoans([]);
       setPairInfo(null);
       return;
     }
 
-    const [{ data: currentPair }, { data: pairMembers }, { data: sharedSubscriptions }, { data: sharedLoans }] = await Promise.all([
-      supabase.from("pairs").select("id, name, icon_url").eq("id", nextPairId).maybeSingle(),
-      supabase.from("pair_member_profiles").select("user_id, display_name").eq("pair_id", nextPairId),
-      supabase.from("subscriptions").select("*").eq("pair_id", nextPairId).order("created_at", { ascending: false }),
-      supabase.from("loans").select("*, loan_repayments(*)").eq("pair_id", nextPairId).order("created_at", { ascending: false }),
-    ]);
+    const currentPair = pairState.pair;
+    const pairMembers = pairState.members || [];
+    try {
+      const apiLoans = await apiRequest<Loan[]>("/api/loans");
+      setLoans(apiLoans || []);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "貸し借りを読み込めませんでした。");
+    }
 
     setPairInfo(currentPair as PairInfo | null);
     setPairForm({
@@ -432,15 +537,19 @@ function MoneyApp({
       displayName: pairMembers?.find((member) => member.user_id === user.id)?.display_name || profile?.display_name || "",
       iconUrl: currentPair?.icon_url || "",
     });
-    setMembers((pairMembers || []) as PairMember[]);
-    setSubscriptions((sharedSubscriptions || []) as Subscription[]);
-    setLoans((sharedLoans || []) as Loan[]);
+    setMembers(pairMembers as PairMember[]);
   }
 
   useEffect(() => {
     void refreshAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!subscriptions.length && !loans.length) return;
+    void syncGeneratedEntries(selectedMonth);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedMonth, subscriptions.length, loans.length]);
 
   const paymentRows = useMemo(() => {
     const subscriptionPayments = subscriptions.flatMap((subscription) => {
@@ -501,15 +610,65 @@ function MoneyApp({
   const expenseTotal = sum(monthEntries.filter((entry) => entry.type === "expense"));
   const myOutgoing = sum(paymentRows.filter((row) => row.payer === "me"));
   const myIncoming = sum(paymentRows.filter((row) => row.receiver === selfName));
+  const selectedSubscription = subscriptions.find((subscription) => subscription.id === subscriptionId);
   const selectedEntry = entries.find((entry) => entry.id === entryId);
   const selectedLoan = loans.find((loan) => loan.id === loanId);
   const canAddLoan = !loans.length || loans.some((loan) => loan.lender_user_id === user.id);
 
+  useEffect(() => {
+    if (view !== "subscriptionEdit" || !selectedSubscription) return;
+    setSubscriptionForm({
+      name: selectedSubscription.name,
+      is_shared: selectedSubscription.is_shared,
+      owner: toPerson(selectedSubscription.owner_user_id),
+      payer: toPerson(selectedSubscription.payer_user_id),
+      amount: selectedSubscription.amount,
+      billing_cycle: selectedSubscription.billing_cycle,
+      billing_day_mode: selectedSubscription.billing_day >= 31 ? "end_of_month" : "day",
+      renewal_day: selectedSubscription.renewal_day,
+      renewal_month: selectedSubscription.renewal_month,
+      renewal_weekday: selectedSubscription.renewal_weekday,
+      billing_day: selectedSubscription.billing_day,
+      billing_month: selectedSubscription.billing_month,
+      billing_weekday: selectedSubscription.billing_weekday,
+      share_type: selectedSubscription.share_type,
+      partner_share_value: selectedSubscription.partner_share_value,
+      memo: selectedSubscription.memo || "",
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, selectedSubscription?.id]);
+
+  useEffect(() => {
+    if (view !== "loanEdit" || !selectedLoan) return;
+    setLoanForm({
+      title: selectedLoan.title,
+      lender: toPerson(selectedLoan.lender_user_id),
+      principal_amount: selectedLoan.principal_amount,
+      borrowed_at: selectedLoan.borrowed_at,
+      due_date: selectedLoan.due_date,
+      repayment_type: selectedLoan.repayment_type,
+      installment_count: selectedLoan.installment_count,
+      monthly_amount: selectedLoan.monthly_amount,
+      repayment_day: selectedLoan.repayment_day,
+      repayment_day_mode: selectedLoan.repayment_day_mode,
+      repayment_workplace_id: selectedLoan.repayment_workplace_id || "",
+      memo: selectedLoan.memo || "",
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, selectedLoan?.id]);
+
   async function saveProfile() {
     if (!displayName.trim()) return;
-    const { error } = await supabase.from("profiles").upsert({ id: user.id, display_name: displayName.trim(), avatar_url: profileAvatarUrl || null });
-    setMessage(error ? error.message : "表示名を保存しました。");
-    if (!error) await refreshAll();
+    try {
+      await apiRequest("/api/profile", {
+        method: "PATCH",
+        body: JSON.stringify({ display_name: displayName.trim(), avatar_url: profileAvatarUrl || null }),
+      });
+      setMessage("表示名を保存しました。");
+      await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "プロフィールを保存できませんでした。");
+    }
   }
 
   async function savePairSettings() {
@@ -518,12 +677,16 @@ function MoneyApp({
       setMessage("ペア名とペア内の表示名を入力してください。");
       return;
     }
-    const [{ error: pairError }, { error: memberError }] = await Promise.all([
-      supabase.from("pairs").update({ name: pairForm.name.trim(), icon_url: pairForm.iconUrl || null }).eq("id", pairId),
-      supabase.from("pair_members").update({ display_name: pairForm.displayName.trim() }).eq("pair_id", pairId).eq("user_id", user.id),
-    ]);
-    setMessage(pairError?.message || memberError?.message || "ペア設定を保存しました。");
-    if (!pairError && !memberError) await refreshAll();
+    try {
+      await apiRequest("/api/pair", {
+        method: "PATCH",
+        body: JSON.stringify({ pair_id: pairId, name: pairForm.name.trim(), display_name: pairForm.displayName.trim(), icon_url: pairForm.iconUrl || null }),
+      });
+      setMessage("ペア設定を保存しました。");
+      await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "ペア設定を保存できませんでした。");
+    }
   }
 
   function resetWorkplaceForm() {
@@ -537,27 +700,33 @@ function MoneyApp({
       return;
     }
     const payload = {
-      user_id: user.id,
       name: workplaceForm.name.trim(),
       payday_day: workplaceForm.payday_is_month_end ? null : workplaceForm.payday_day,
       payday_is_month_end: workplaceForm.payday_is_month_end,
     };
-    const { error } = editingWorkplaceId
-      ? await supabase.from("workplaces").update(payload).eq("id", editingWorkplaceId).eq("user_id", user.id)
-      : await supabase.from("workplaces").insert(payload);
-    if (error) setMessage(error.message);
-    else {
+    try {
+      if (editingWorkplaceId) {
+        await apiRequest<Workplace>(`/api/workplaces/${editingWorkplaceId}`, { method: "PATCH", body: JSON.stringify(payload) });
+      } else {
+        await apiRequest<Workplace>("/api/workplaces", { method: "POST", body: JSON.stringify(payload) });
+      }
       setMessage(editingWorkplaceId ? "勤務先を更新しました。" : "勤務先を追加しました。");
       resetWorkplaceForm();
       await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "勤務先を保存できませんでした。");
     }
   }
 
   async function deleteWorkplace(id: string) {
     if (!window.confirm("この勤務先を本当に削除しますか？")) return;
-    const { error } = await supabase.from("workplaces").delete().eq("id", id).eq("user_id", user.id);
-    setMessage(error ? error.message : "勤務先を削除しました。");
-    if (!error) await refreshAll();
+    try {
+      await apiRequest<{ id: string }>(`/api/workplaces/${id}`, { method: "DELETE" });
+      setMessage("勤務先を削除しました。");
+      await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "勤務先を削除できませんでした。");
+    }
   }
 
   async function createPair() {
@@ -569,17 +738,16 @@ function MoneyApp({
     }
     const code = makeInviteCode();
     const codeHash = await sha256(code);
-    const { error } = await supabase.rpc("create_pair_with_invite_hash", {
-      pair_name: nameForPair,
-      invite_hash: codeHash,
-      display_name_input: nameForMe,
-      icon_url_input: pairForm.iconUrl || null,
-    });
-    if (error) setMessage(error.message);
-    else {
+    try {
+      await apiRequest("/api/pair", {
+        method: "POST",
+        body: JSON.stringify({ pair_name: nameForPair, invite_hash: codeHash, display_name: nameForMe, icon_url: pairForm.iconUrl || null }),
+      });
       setInviteCode(code);
       setMessage("ペアを作成しました。");
       await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "ペアを作成できませんでした。");
     }
   }
 
@@ -587,14 +755,15 @@ function MoneyApp({
     if (!pairId || partner) return;
     const code = makeInviteCode();
     const codeHash = await sha256(code);
-    const { error } = await supabase.rpc("regenerate_pair_invite_hash", {
-      pair_id_input: pairId,
-      invite_hash: codeHash,
-    });
-    if (error) setMessage(error.message);
-    else {
+    try {
+      await apiRequest("/api/pair/invite", {
+        method: "PATCH",
+        body: JSON.stringify({ pair_id: pairId, invite_hash: codeHash }),
+      });
       setInviteCode(code);
       setMessage("新しい招待コードを発行しました。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "招待コードを発行できませんでした。");
     }
   }
 
@@ -604,62 +773,140 @@ function MoneyApp({
       return;
     }
     const codeHash = await sha256(joinCode.trim().toUpperCase());
-    const { error } = await supabase.rpc("join_pair_with_invite_hash", {
-      invite_hash: codeHash,
-      display_name_input: displayName.trim(),
-    });
-    if (error) setMessage(error.message);
-    else {
+    try {
+      await apiRequest("/api/pair/join", {
+        method: "POST",
+        body: JSON.stringify({ invite_hash: codeHash, display_name: displayName.trim() }),
+      });
       setJoinCode("");
       setMessage("ペアに参加しました。");
       await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "ペアに参加できませんでした。");
     }
   }
 
-  async function addSubscription() {
-    if (!pairId || !subscriptionForm.name.trim() || subscriptionForm.amount <= 0) return;
+  function buildSubscriptionPayload() {
     const billingDay =
-      subscriptionForm.billing_cycle === "monthly" && subscriptionForm.billing_day_mode === "end_of_month"
-        ? 31
-        : subscriptionForm.billing_cycle === "monthly" && subscriptionForm.billing_day_mode === "payday"
-          ? 25
-          : subscriptionForm.billing_day;
-    const { error } = await supabase.from("subscriptions").insert({
-      pair_id: pairId,
-      name: subscriptionForm.name.trim(),
-      owner_user_id: personId(subscriptionForm.owner),
-      amount: subscriptionForm.amount,
-      billing_cycle: subscriptionForm.billing_cycle,
+      !subscriptionForm.is_shared
+        ? subscriptionForm.renewal_day
+        : subscriptionForm.billing_cycle === "monthly" && subscriptionForm.billing_day_mode === "end_of_month"
+          ? 31
+          : subscriptionForm.billing_cycle === "monthly" && subscriptionForm.billing_day_mode === "payday"
+            ? 25
+            : subscriptionForm.billing_day;
+
+    return {
+      ...subscriptionForm,
+      pair_id: subscriptionForm.is_shared ? pairId : null,
+      owner_user_id: subscriptionForm.is_shared ? personId(subscriptionForm.owner) : user.id,
+      payer_user_id: subscriptionForm.is_shared ? personId(subscriptionForm.payer) : user.id,
       billing_day: billingDay,
-      billing_month: subscriptionForm.billing_month,
-      share_type: subscriptionForm.share_type,
-      partner_share_value: subscriptionForm.partner_share_value,
-      status: "active",
-    });
-    if (error) setMessage(error.message);
-    else window.location.href = "/subscriptions";
+      billing_month: subscriptionForm.is_shared ? subscriptionForm.billing_month : subscriptionForm.renewal_month,
+      billing_weekday: subscriptionForm.is_shared ? subscriptionForm.billing_weekday : subscriptionForm.renewal_weekday,
+    };
+  }
+
+  async function addSubscription() {
+    if (!subscriptionForm.name.trim() || subscriptionForm.amount <= 0) {
+      setMessage("サブスク名と金額を入力してください。");
+      return;
+    }
+    if (subscriptionForm.is_shared && !pairId) {
+      setMessage("共有サブスクは先にペアを作成してください。");
+      return;
+    }
+    try {
+      await apiRequest<Subscription>("/api/subscriptions", {
+        method: "POST",
+        body: JSON.stringify(buildSubscriptionPayload()),
+      });
+      window.location.href = "/subscriptions";
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "サブスクを登録できませんでした。");
+    }
+  }
+
+  async function updateSubscription() {
+    if (!selectedSubscription) return;
+    if (!subscriptionForm.name.trim() || subscriptionForm.amount <= 0) {
+      setMessage("サブスク名と金額を入力してください。");
+      return;
+    }
+    try {
+      await apiRequest<Subscription>(`/api/subscriptions/${selectedSubscription.id}`, {
+        method: "PATCH",
+        body: JSON.stringify(buildSubscriptionPayload()),
+      });
+      setMessage("サブスクを更新しました。");
+      window.location.href = `/subscriptions/${selectedSubscription.id}`;
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "サブスクを更新できませんでした。");
+    }
+  }
+
+  async function deleteSubscription(subscriptionIdToDelete: string) {
+    if (!window.confirm("このサブスクを停止しますか？")) return;
+    const stopNextMonth = window.confirm("来月分から停止しますか？\nOK: 来月分から停止\nキャンセル: 今月分から停止");
+    try {
+      await apiRequest<Subscription>(`/api/subscriptions/${subscriptionIdToDelete}`, {
+        method: "DELETE",
+        body: JSON.stringify({ stop_mode: stopNextMonth ? "next_month" : "this_month" }),
+      });
+      setMessage("サブスクを停止しました。");
+      window.location.href = "/subscriptions";
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "サブスクを停止できませんでした。");
+    }
   }
 
   async function addLoan() {
     if (!pairId || !loanForm.title.trim() || loanForm.principal_amount <= 0) return;
     const lenderId = personId(loanForm.lender);
     const borrowerId = loanForm.lender === "me" ? personId("partner") : user.id;
-    const { error } = await supabase.from("loans").insert({
-      pair_id: pairId,
-      title: loanForm.title.trim(),
-      lender_user_id: lenderId,
-      borrower_user_id: borrowerId,
-      principal_amount: loanForm.principal_amount,
-      borrowed_at: loanForm.borrowed_at,
-      due_date: loanForm.due_date,
-      repayment_type: loanForm.repayment_type,
-      installment_count: loanForm.installment_count,
-      monthly_amount: loanForm.monthly_amount,
-      repayment_day: loanForm.repayment_day,
-      status: "active",
-    });
-    if (error) setMessage(error.message);
-    else window.location.href = "/loans";
+    try {
+      await apiRequest<Loan>("/api/loans", {
+        method: "POST",
+        body: JSON.stringify({
+          ...loanForm,
+          pair_id: pairId,
+          lender_user_id: lenderId,
+          borrower_user_id: borrowerId,
+        }),
+      });
+      window.location.href = "/loans";
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "貸し借りを登録できませんでした。");
+    }
+  }
+
+  async function updateLoan() {
+    if (!selectedLoan) return;
+    if (!loanForm.title.trim() || loanForm.principal_amount <= 0) {
+      setMessage("貸し借り名と金額を入力してください。");
+      return;
+    }
+    try {
+      await apiRequest<Loan>(`/api/loans/${selectedLoan.id}`, {
+        method: "PATCH",
+        body: JSON.stringify(loanForm),
+      });
+      setMessage("貸し借りを更新しました。");
+      window.location.href = `/loans/${selectedLoan.id}`;
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "貸し借りを更新できませんでした。");
+    }
+  }
+
+  async function deleteLoan(loanIdToDelete: string) {
+    if (!window.confirm("この貸し借りを本当に削除しますか？")) return;
+    try {
+      await apiRequest<{ id: string }>(`/api/loans/${loanIdToDelete}`, { method: "DELETE" });
+      setMessage("貸し借りを削除しました。");
+      window.location.href = "/loans";
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "貸し借りを削除できませんでした。");
+    }
   }
 
   async function addRepayment(loanId: string) {
@@ -677,20 +924,17 @@ function MoneyApp({
       return;
     }
     const paidAt = draft.paid_at || new Date().toISOString().slice(0, 10);
-    const { error } = await supabase.from("loan_repayments").insert({
-      loan_id: loanId,
-      paid_at: paidAt,
-      amount: draft.amount,
-      method: "送金",
-    });
-    if (error) setMessage(error.message);
-    else {
-      if (remaining - draft.amount <= 0) {
-        await supabase.from("loans").update({ status: "paid" }).eq("id", loanId);
-      }
+    try {
+      await apiRequest<Repayment>(`/api/loans/${loanId}/repayments`, {
+        method: "POST",
+        body: JSON.stringify({ amount: draft.amount, paid_at: paidAt }),
+      });
+      await confirmRepaymentEntries(loan, draft.amount, paidAt);
       setMessage("返済を登録しました。");
       setRepaymentDrafts((current) => ({ ...current, [loanId]: { amount: 0, paid_at: "" } }));
       await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "返済を登録できませんでした。");
     }
   }
 
@@ -699,17 +943,15 @@ function MoneyApp({
       setMessage("名前と金額を入力してください。");
       return;
     }
-    const { error } = await supabase.from("personal_entries").insert({
-      user_id: user.id,
-      type: entryForm.type,
-      title: entryForm.title.trim(),
-      amount: entryForm.amount,
-      entry_date: entryForm.entry_date,
-      category: entryForm.category,
-      source: entryForm.source,
-    });
-    if (error) setMessage(error.message);
-    else window.location.href = "/personal";
+    try {
+      await apiRequest<PersonalEntry>("/api/personal/entries", {
+        method: "POST",
+        body: JSON.stringify(entryForm),
+      });
+      window.location.href = "/personal";
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "収支を登録できませんでした。");
+    }
   }
 
   async function updateEntry(entryIdToUpdate: string) {
@@ -717,31 +959,143 @@ function MoneyApp({
       setMessage("名前と金額を入力してください。");
       return;
     }
-    const { error } = await supabase
-      .from("personal_entries")
-      .update({
-        type: entryForm.type,
-        title: entryForm.title.trim(),
-        amount: entryForm.amount,
-        entry_date: entryForm.entry_date,
-        category: entryForm.category,
-        source: entryForm.source,
-      })
-      .eq("id", entryIdToUpdate)
-      .eq("user_id", user.id);
-    if (error) setMessage(error.message);
-    else {
+    try {
+      await apiRequest<PersonalEntry>(`/api/personal/entries/${entryIdToUpdate}`, {
+        method: "PATCH",
+        body: JSON.stringify(entryForm),
+      });
       setMessage("収支を更新しました。");
       setEditingEntryId(null);
       await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "収支を更新できませんでした。");
     }
   }
 
   async function deleteEntry(entryIdToDelete: string) {
     if (!window.confirm("この収支を本当に削除しますか？")) return;
-    const { error } = await supabase.from("personal_entries").delete().eq("id", entryIdToDelete).eq("user_id", user.id);
-    setMessage(error ? error.message : "収支を削除しました。");
-    if (!error) await refreshAll();
+    try {
+      await apiRequest<{ id: string }>(`/api/personal/entries/${entryIdToDelete}`, { method: "DELETE" });
+      setMessage("収支を削除しました。");
+      await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "収支を削除できませんでした。");
+    }
+  }
+
+  async function upsertGeneratedEntry(entry: Omit<PersonalEntry, "id">) {
+    try {
+      await apiRequest<PersonalEntry | { skipped: boolean; id: string }>("/api/personal/entries/generated", {
+        method: "POST",
+        body: JSON.stringify(entry),
+      });
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "予定収支を同期できませんでした。");
+    }
+  }
+
+  async function syncGeneratedEntries(month: string) {
+    try {
+      await apiRequest<{ count: number }>("/api/subscriptions/sync", {
+        method: "POST",
+        body: JSON.stringify({ month }),
+      });
+      const personalEntries = await apiRequest<PersonalEntry[]>("/api/personal/entries");
+      setEntries(personalEntries || []);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "サブスク予定の同期に失敗しました。");
+    }
+
+    const generated: Omit<PersonalEntry, "id">[] = [];
+
+    ([] as Subscription[]).forEach((subscription) => {
+      if (!subscriptionOccurs(subscription, month)) return;
+      if (subscription.payer_user_id !== user.id) return;
+      const paymentDate = paymentDateForSubscription(subscription, month);
+      generated.push({
+        user_id: user.id,
+        type: "expense",
+        entry_status: entryStatusForDate(paymentDate),
+        title: titleForSubscription(subscription, month),
+        amount: subscription.amount,
+        entry_date: paymentDate,
+        category: "サブスク",
+        source: subscription.name,
+        source_type: "subscription",
+        source_id: subscription.id,
+        period_key: periodKeyForSubscription(subscription, month),
+        scheduled_date: paymentDate,
+        excluded_at: null,
+      });
+    });
+
+    loans.forEach((loan) => {
+      const isLender = loan.lender_user_id === user.id;
+      const isBorrower = loan.borrower_user_id === user.id;
+      if (!isLender && !isBorrower) return;
+      const otherName = personLabel(toPerson(isLender ? loan.borrower_user_id : loan.lender_user_id));
+      if (monthOf(loan.borrowed_at) === month) {
+        generated.push({
+          user_id: user.id,
+          type: isLender ? "expense" : "income",
+          entry_status: "confirmed",
+          title: isLender ? `${otherName}さんへ貸付：${loan.title}` : `${otherName}さんから借入：${loan.title}`,
+          amount: loan.principal_amount,
+          entry_date: loan.borrowed_at,
+          category: isLender ? "貸付" : "借入",
+          source: loan.title,
+          source_type: "loan",
+          source_id: loan.id,
+          period_key: `${loan.id}:principal`,
+          scheduled_date: loan.borrowed_at,
+          excluded_at: null,
+        });
+      }
+
+      const scheduled = scheduledLoanAmount(loan, month);
+      if (scheduled <= 0 || loan.status === "paid" || loan.status === "canceled") return;
+      const dueDate = dateFor(month, loan.repayment_day);
+      generated.push({
+        user_id: user.id,
+        type: isLender ? "income" : "expense",
+        entry_status: entryStatusForDate(dueDate),
+        title: isLender ? `返済予定：${loan.title}` : `返済予定：${loan.title}`,
+        amount: scheduled,
+        entry_date: dueDate,
+        category: isLender ? "返済予定" : "返済",
+        source: loan.title,
+        source_type: "repayment",
+        source_id: loan.id,
+        period_key: month,
+        scheduled_date: dueDate,
+        excluded_at: null,
+      });
+    });
+
+    for (const entry of generated) {
+      await upsertGeneratedEntry(entry);
+    }
+  }
+
+  async function confirmRepaymentEntries(loan: Loan, amount: number, paidAt: string) {
+    const isLender = loan.lender_user_id === user.id;
+    const isBorrower = loan.borrower_user_id === user.id;
+    if (!isLender && !isBorrower) return;
+    await upsertGeneratedEntry({
+      user_id: user.id,
+      type: isLender ? "income" : "expense",
+      entry_status: "confirmed",
+      title: isLender ? `返済受取：${loan.title}` : `返済：${loan.title}`,
+      amount,
+      entry_date: paidAt,
+      category: isLender ? "返済" : "返済",
+      source: loan.title,
+      source_type: "repayment",
+      source_id: loan.id,
+      period_key: `paid:${paidAt}`,
+      scheduled_date: paidAt,
+      excluded_at: null,
+    });
   }
 
   async function addCategory() {
@@ -749,19 +1103,17 @@ function MoneyApp({
       setMessage("カテゴリ名を入力してください。");
       return;
     }
-    const { error } = await supabase.from("personal_categories").insert({
-      user_id: user.id,
-      pair_id: pairId,
-      type: categoryForm.type,
-      name: categoryForm.name.trim(),
-    });
-    if (error) {
-      setMessage(error.code === "23505" ? "同じカテゴリがすでに登録されています。" : error.message);
-      return;
+    try {
+      await apiRequest<PersonalCategory>("/api/personal/categories", {
+        method: "POST",
+        body: JSON.stringify({ pair_id: pairId, type: categoryForm.type, name: categoryForm.name.trim() }),
+      });
+      setMessage("カテゴリを追加しました。");
+      setCategoryForm({ type: "expense", name: "" });
+      await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "カテゴリを追加できませんでした。");
     }
-    setMessage("カテゴリを追加しました。");
-    setCategoryForm({ type: "expense", name: "" });
-    await refreshAll();
   }
 
   async function updateCategory(category: PersonalCategory) {
@@ -769,29 +1121,29 @@ function MoneyApp({
       setMessage("カテゴリ名を入力してください。");
       return;
     }
-    const { error } = await supabase
-      .from("personal_categories")
-      .update({ name: editingCategoryName.trim() })
-      .eq("id", category.id)
-      .eq("user_id", user.id);
-    if (error) setMessage(error.code === "23505" ? "同じカテゴリがすでに登録されています。" : error.message);
-    else {
+    try {
+      await apiRequest<PersonalCategory>(`/api/personal/categories/${category.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name: editingCategoryName.trim() }),
+      });
       setMessage("カテゴリを更新しました。");
       setEditingCategoryId(null);
       setEditingCategoryName("");
       await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "カテゴリを更新できませんでした。");
     }
   }
 
   async function deleteCategory(category: PersonalCategory) {
-    if (entries.some((entry) => entry.category === category.name && entry.type === category.type)) {
-      setMessage("このカテゴリは収支データで使用中です。先に収支のカテゴリを変更してください。");
-      return;
-    }
     if (!window.confirm("このカテゴリを本当に削除しますか？")) return;
-    const { error } = await supabase.from("personal_categories").delete().eq("id", category.id).eq("user_id", user.id);
-    setMessage(error ? error.message : "カテゴリを削除しました。");
-    if (!error) await refreshAll();
+    try {
+      await apiRequest<{ id: string }>(`/api/personal/categories/${category.id}`, { method: "DELETE" });
+      setMessage("カテゴリを削除しました。");
+      await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "カテゴリを削除できませんでした。");
+    }
   }
 
   async function changePassword() {
@@ -876,6 +1228,7 @@ function MoneyApp({
             selectedMonth={selectedMonth}
             personLabel={personLabel}
             toPerson={toPerson}
+            deleteSubscription={deleteSubscription}
             exportRows={() => exportWorkbook(subscriptions, "サブスク", `サブスク_${selectedMonth}.xlsx`)}
           />
         )}
@@ -890,11 +1243,35 @@ function MoneyApp({
           />
         )}
 
+        {view === "subscriptionDetail" && (
+          <SubscriptionDetailView
+            subscription={selectedSubscription}
+            selectedMonth={selectedMonth}
+            personLabel={personLabel}
+            toPerson={toPerson}
+            deleteSubscription={deleteSubscription}
+          />
+        )}
+
+        {view === "subscriptionEdit" && (
+          <SubscriptionFormView
+            form={subscriptionForm}
+            setForm={setSubscriptionForm}
+            selfName={selfName}
+            partnerName={partnerName}
+            onSubmit={updateSubscription}
+            title="サブスク編集"
+            submitLabel="更新する"
+          />
+        )}
+
         {view === "loans" && (
           pairId ? (
             <LoansList
               loans={loans}
               canAddLoan={canAddLoan}
+              currentUserId={user.id}
+              deleteLoan={deleteLoan}
               exportRows={() => exportWorkbook(loans, "貸し借り", `貸し借り_${selectedMonth}.xlsx`)}
             />
           ) : (
@@ -915,6 +1292,20 @@ function MoneyApp({
             repaymentDrafts={repaymentDrafts}
             setRepaymentDrafts={setRepaymentDrafts}
             addRepayment={addRepayment}
+            currentUserId={user.id}
+            deleteLoan={deleteLoan}
+          />
+        )}
+
+        {view === "loanEdit" && (
+          <LoanFormView
+            form={loanForm}
+            setForm={setLoanForm}
+            selfName={selfName}
+            partnerName={partnerName}
+            onSubmit={updateLoan}
+            title="貸し借り編集"
+            submitLabel="更新する"
           />
         )}
 
@@ -1083,37 +1474,88 @@ function SubscriptionsList({
   selectedMonth,
   personLabel,
   toPerson,
+  deleteSubscription,
   exportRows,
 }: {
   subscriptions: Subscription[];
   selectedMonth: string;
   personLabel: (person: Person) => string;
   toPerson: (id: string) => Person;
+  deleteSubscription: (subscriptionId: string) => void;
   exportRows: () => void;
 }) {
   return (
     <section className="view">
       <PageHead title="サブスク一覧" backHref="/" actions={<><Link className="button primary" href="/subscriptions/new"><Plus size={16} />追加</Link><button className="button ghost" onClick={exportRows}><Download size={16} />Excel</button></>} />
-      <div className="card-grid">
+      <div className="ledger-list">
         {subscriptions.map((subscription) => (
-          <article className="item-card" key={subscription.id}>
-            <div className="item-heading">
+          <div className="ledger-row action-row" key={subscription.id}>
+            <Link className="ledger-main clickable-row" href={`/subscriptions/${subscription.id}`}>
+              <span className={subscription.is_shared ? "pill blue" : "pill"}>{subscription.is_shared ? "共有" : "個人"}</span>
               <div>
-                <h3>{subscription.name}</h3>
-                <p>{personLabel(toPerson(subscription.owner_user_id))}が契約者</p>
+                <strong>{subscription.name}</strong>
+                <small>{personLabel(toPerson(subscription.owner_user_id))}が契約者 / {subscriptionOccurs(subscription, selectedMonth) ? "今月支払いあり" : "今月なし"}</small>
               </div>
               <b>{yen.format(subscription.amount)}</b>
+            </Link>
+            <div className="icon-actions">
+              <Link className="icon-button" aria-label="サブスクを編集" title="編集" href={`/subscriptions/${subscription.id}/edit`}>
+                <Pencil size={18} />
+              </Link>
+              <button className="icon-button danger-icon" aria-label="サブスクを停止" title="停止" onClick={() => deleteSubscription(subscription.id)}>
+                <Trash2 size={18} />
+              </button>
             </div>
-            <dl>
-              <div><dt>周期</dt><dd>{subscription.billing_cycle === "monthly" ? "毎月" : `${subscription.billing_month}月の年1回`}</dd></div>
-              <div><dt>支払日</dt><dd>{subscription.billing_day >= 31 ? "月末" : `${subscription.billing_day}日`}</dd></div>
-              <div><dt>相方側負担</dt><dd>{subscription.share_type === "percentage" ? `${subscription.partner_share_value}%` : yen.format(subscription.partner_share_value)}</dd></div>
-              <div><dt>今月</dt><dd>{subscriptionOccurs(subscription, selectedMonth) ? "支払いあり" : "なし"}</dd></div>
-            </dl>
-          </article>
+          </div>
         ))}
       </div>
       {!subscriptions.length && <EmptyState text="登録済みのサブスクはありません。" />}
+    </section>
+  );
+}
+
+function SubscriptionDetailView({
+  subscription,
+  selectedMonth,
+  personLabel,
+  toPerson,
+  deleteSubscription,
+}: {
+  subscription?: Subscription;
+  selectedMonth: string;
+  personLabel: (person: Person) => string;
+  toPerson: (id: string) => Person;
+  deleteSubscription: (subscriptionId: string) => void;
+}) {
+  if (!subscription) {
+    return (
+      <section className="view">
+        <PageHead title="サブスク詳細" backHref="/subscriptions" />
+        <EmptyState text="サブスクが見つかりません。" />
+      </section>
+    );
+  }
+  const paymentDate = subscriptionOccurs(subscription, selectedMonth) ? paymentDateForSubscription(subscription, selectedMonth) : "なし";
+  return (
+    <section className="view">
+      <PageHead
+        title="サブスク詳細"
+        backHref="/subscriptions"
+        actions={<><Link className="button ghost" href={`/subscriptions/${subscription.id}/edit`}><Pencil size={16} />編集</Link><button className="button danger" onClick={() => deleteSubscription(subscription.id)}><Trash2 size={16} />停止</button></>}
+      />
+      <Panel title={subscription.name} action={subscription.status === "active" ? "利用中" : "停止済み"}>
+        <dl className="detail-list">
+          <div><dt>種類</dt><dd>{subscription.is_shared ? "共有サブスク" : "個人サブスク"}</dd></div>
+          <div><dt>契約者</dt><dd>{personLabel(toPerson(subscription.owner_user_id))}</dd></div>
+          <div><dt>実際に支払う人</dt><dd>{personLabel(toPerson(subscription.payer_user_id))}</dd></div>
+          <div><dt>金額</dt><dd>{yen.format(subscription.amount)}</dd></div>
+          <div><dt>支払い周期</dt><dd>{subscription.billing_cycle === "weekly" ? "週払い" : subscription.billing_cycle === "yearly" ? "年払い" : "月払い"}</dd></div>
+          <div><dt>今月の支払日</dt><dd>{paymentDate}</dd></div>
+          <div><dt>相方側の負担</dt><dd>{subscription.share_type === "percentage" ? `${subscription.partner_share_value}%` : yen.format(subscription.partner_share_value)}</dd></div>
+          <div><dt>停止開始月</dt><dd>{subscription.stop_billing_from || "未設定"}</dd></div>
+          <div><dt>メモ</dt><dd>{subscription.memo || "なし"}</dd></div>
+        </dl>
+      </Panel>
     </section>
   );
 }
@@ -1124,37 +1566,73 @@ function SubscriptionFormView({
   selfName,
   partnerName,
   onSubmit,
+  title = "サブスク追加",
+  submitLabel = "登録する",
 }: {
   form: typeof subscriptionDefaults;
   setForm: (form: typeof subscriptionDefaults) => void;
   selfName: string;
   partnerName: string;
   onSubmit: () => void;
+  title?: string;
+  submitLabel?: string;
 }) {
   return (
     <section className="view">
-      <PageHead title="サブスク追加" backHref="/subscriptions" />
+      <PageHead title={title} backHref="/subscriptions" />
       <Panel title="サブスク情報">
         <div className="stack-form">
           <TextField label="サブスク名" value={form.name} onChange={(value) => setForm({ ...form, name: value })} />
-          <NumberField label="金額" unit="円" value={form.amount} onChange={(value) => setForm({ ...form, amount: value })} />
-          <SelectField label="契約者" value={form.owner} onChange={(value) => setForm({ ...form, owner: value as Person })} options={[["me", selfName], ["partner", partnerName]]} />
-          <SelectField label="周期" value={form.billing_cycle} onChange={(value) => setForm({ ...form, billing_cycle: value as BillingCycle })} options={[["monthly", "月払い"], ["yearly", "年払い"]]} />
-          {form.billing_cycle === "monthly" ? (
+          <SelectField label="共有設定" value={form.is_shared ? "shared" : "private"} onChange={(value) => setForm({ ...form, is_shared: value === "shared" })} options={[["shared", "共有する"], ["private", "共有しない"]]} />
+          <SelectField label="支払い周期" value={form.billing_cycle} onChange={(value) => setForm({ ...form, billing_cycle: value as BillingCycle })} options={[["weekly", "週払い"], ["monthly", "月払い"], ["yearly", "年払い"]]} />
+          <NumberField label="金額" unit={form.billing_cycle === "weekly" ? "円/週" : form.billing_cycle === "yearly" ? "円/年" : "円/月"} value={form.amount} onChange={(value) => setForm({ ...form, amount: value })} />
+          {form.is_shared ? (
             <>
-              <SelectField label="支払日の種類" value={form.billing_day_mode} onChange={(value) => setForm({ ...form, billing_day_mode: value as BillingDayMode })} options={[["day", "日付を指定"], ["end_of_month", "月末"], ["payday", "給料日"]]} />
-              {form.billing_day_mode === "day" && <NumberField label="支払日" unit="日" value={form.billing_day} onChange={(value) => setForm({ ...form, billing_day: value })} />}
+              <SelectField label="契約者" value={form.owner} onChange={(value) => setForm({ ...form, owner: value as Person })} options={[["me", selfName], ["partner", partnerName]]} />
+              <SelectField label="実際に支払う人" value={form.payer} onChange={(value) => setForm({ ...form, payer: value as Person })} options={[["me", selfName], ["partner", partnerName]]} />
             </>
           ) : (
             <>
-              <NumberField label="年払い月" unit="月" value={form.billing_month} onChange={(value) => setForm({ ...form, billing_month: value })} />
-              <NumberField label="支払日" unit="日" value={form.billing_day} onChange={(value) => setForm({ ...form, billing_day: value })} />
+              <div className="readonly-field"><span>契約者</span><strong>{selfName}</strong></div>
+              <div className="readonly-field"><span>実際に支払う人</span><strong>{selfName}</strong></div>
             </>
           )}
-          <SelectField label="負担方式" value={form.share_type} onChange={(value) => setForm({ ...form, share_type: value as ShareType })} options={[["percentage", "比率"], ["fixed", "固定額"]]} />
-          <NumberField label={form.share_type === "percentage" ? "相方側の負担率" : "相方側の負担額"} unit={form.share_type === "percentage" ? "%" : "円"} value={form.partner_share_value} onChange={(value) => setForm({ ...form, partner_share_value: value })} />
+          {form.billing_cycle === "monthly" ? (
+            <>
+              <NumberField label="更新日" unit="毎月の日" value={form.renewal_day} onChange={(value) => setForm({ ...form, renewal_day: value })} />
+              {form.is_shared && (
+                <>
+                  <SelectField label="支払日の種類" value={form.billing_day_mode} onChange={(value) => setForm({ ...form, billing_day_mode: value as BillingDayMode })} options={[["day", "日付を指定"], ["end_of_month", "月末"], ["payday", "給料日"]]} />
+                  {form.billing_day_mode === "day" && <NumberField label="支払日" unit="日" value={form.billing_day} onChange={(value) => setForm({ ...form, billing_day: value })} />}
+                </>
+              )}
+            </>
+          ) : form.billing_cycle === "yearly" ? (
+            <>
+              <NumberField label="更新月" unit="月" value={form.renewal_month} onChange={(value) => setForm({ ...form, renewal_month: value })} />
+              <NumberField label="更新日" unit="日" value={form.renewal_day} onChange={(value) => setForm({ ...form, renewal_day: value })} />
+              {form.is_shared && (
+                <>
+                  <NumberField label="支払月" unit="月" value={form.billing_month} onChange={(value) => setForm({ ...form, billing_month: value })} />
+                  <NumberField label="支払日" unit="日" value={form.billing_day} onChange={(value) => setForm({ ...form, billing_day: value })} />
+                </>
+              )}
+            </>
+          ) : (
+            <>
+              <SelectField label="更新曜日" value={String(form.renewal_weekday)} onChange={(value) => setForm({ ...form, renewal_weekday: Number(value) })} options={weekdayOptions} />
+              {form.is_shared && <SelectField label="支払曜日" value={String(form.billing_weekday)} onChange={(value) => setForm({ ...form, billing_weekday: Number(value) })} options={weekdayOptions} />}
+            </>
+          )}
+          {form.is_shared && (
+            <>
+              <SelectField label="負担方式" value={form.share_type} onChange={(value) => setForm({ ...form, share_type: value as ShareType })} options={[["percentage", "比率"], ["fixed", "固定額"]]} />
+              <NumberField label={form.share_type === "percentage" ? "相方側の負担率" : "相方側の負担額"} unit={form.share_type === "percentage" ? "%" : "円"} value={form.partner_share_value} onChange={(value) => setForm({ ...form, partner_share_value: value })} />
+            </>
+          )}
+          <TextField label="メモ" unit="任意" value={form.memo} onChange={(value) => setForm({ ...form, memo: value })} />
         </div>
-        <button className="button primary form-submit" onClick={onSubmit}>登録する</button>
+        <button className="button primary form-submit" onClick={onSubmit}>{submitLabel}</button>
       </Panel>
     </section>
   );
@@ -1163,10 +1641,14 @@ function SubscriptionFormView({
 function LoansList({
   loans,
   canAddLoan,
+  currentUserId,
+  deleteLoan,
   exportRows,
 }: {
   loans: Loan[];
   canAddLoan: boolean;
+  currentUserId: string;
+  deleteLoan: (loanId: string) => void;
   exportRows: () => void;
 }) {
   return (
@@ -1176,18 +1658,30 @@ function LoansList({
         backHref="/"
         actions={<>{canAddLoan && <Link className="button primary" href="/loans/new"><Plus size={16} />追加</Link>}<button className="button ghost" onClick={exportRows}><Download size={16} />Excel</button></>}
       />
-      <div className="card-grid">
+      <div className="ledger-list">
         {loans.map((loan) => {
+          const canManage = loan.lender_user_id === currentUserId;
           return (
-            <Link className="item-card loan-card clickable-card" href={`/loans/${loan.id}`} key={loan.id}>
-              <div className="item-heading">
+            <div className="ledger-row action-row" key={loan.id}>
+              <Link className="ledger-main clickable-row" href={`/loans/${loan.id}`}>
+                <span className={loan.status === "paid" ? "pill blue" : "pill"}>{loan.status === "paid" ? "完済" : "進行中"}</span>
                 <div>
-                  <h3>{loan.title}</h3>
-                  <p>{loan.status === "paid" ? "完済済み" : "詳細を表示"}</p>
+                  <strong>{loan.title}</strong>
+                  <small>{loan.status === "paid" ? "完済済み" : "詳細を表示"}</small>
                 </div>
                 <b>{yen.format(loan.principal_amount)}</b>
-              </div>
-            </Link>
+              </Link>
+              {canManage && (
+                <div className="icon-actions">
+                  <Link className="icon-button" aria-label="貸し借りを編集" title="編集" href={`/loans/${loan.id}/edit`}>
+                    <Pencil size={18} />
+                  </Link>
+                  <button className="icon-button danger-icon" aria-label="貸し借りを削除" title="削除" onClick={() => deleteLoan(loan.id)}>
+                    <Trash2 size={18} />
+                  </button>
+                </div>
+              )}
+            </div>
           );
         })}
       </div>
@@ -1204,6 +1698,8 @@ function LoanDetailView({
   repaymentDrafts,
   setRepaymentDrafts,
   addRepayment,
+  currentUserId,
+  deleteLoan,
 }: {
   loan?: Loan;
   selectedMonth: string;
@@ -1212,6 +1708,8 @@ function LoanDetailView({
   repaymentDrafts: Record<string, { amount: number; paid_at: string }>;
   setRepaymentDrafts: (drafts: Record<string, { amount: number; paid_at: string }>) => void;
   addRepayment: (loanId: string) => void;
+  currentUserId: string;
+  deleteLoan: (loanId: string) => void;
 }) {
   if (!loan) {
     return (
@@ -1224,9 +1722,14 @@ function LoanDetailView({
   const repaid = sum(loan.loan_repayments);
   const remaining = Math.max(0, loan.principal_amount - repaid);
   const draft = repaymentDrafts[loan.id] ?? { amount: 0, paid_at: "" };
+  const canManage = loan.lender_user_id === currentUserId;
   return (
     <section className="view">
-      <PageHead title="貸し借り詳細" backHref="/loans" />
+      <PageHead
+        title="貸し借り詳細"
+        backHref="/loans"
+        actions={canManage ? <><Link className="button ghost" href={`/loans/${loan.id}/edit`}><Pencil size={16} />編集</Link><button className="button danger" onClick={() => deleteLoan(loan.id)}><Trash2 size={16} />削除</button></> : undefined}
+      />
       <Panel title={loan.title} action={remaining === 0 ? "完済済み" : `残金 ${yen.format(remaining)}`}>
         <dl className="detail-list">
           <div><dt>貸した人</dt><dd>{personLabel(toPerson(loan.lender_user_id))}</dd></div>
@@ -1240,7 +1743,7 @@ function LoanDetailView({
         </dl>
       </Panel>
 
-      {remaining > 0 && (
+      {remaining > 0 && canManage && (
         <Panel title="返済登録" action="金額のみで登録できます">
           <div className="repayment-form detail-repayment-form">
             <NumberField label="返済金額" unit="円" value={draft.amount} onChange={(amount) => setRepaymentDrafts({ ...repaymentDrafts, [loan.id]: { ...draft, amount } })} />
@@ -1278,16 +1781,20 @@ function LoanFormView({
   selfName,
   partnerName,
   onSubmit,
+  title = "貸し借り追加",
+  submitLabel = "登録する",
 }: {
   form: typeof loanDefaults;
   setForm: (form: typeof loanDefaults) => void;
   selfName: string;
   partnerName: string;
   onSubmit: () => void;
+  title?: string;
+  submitLabel?: string;
 }) {
   return (
     <section className="view">
-      <PageHead title="貸し借り追加" backHref="/loans" />
+      <PageHead title={title} backHref="/loans" />
       <Panel title="貸し借り情報">
         <div className="stack-form">
           <TextField label="取引名" value={form.title} onChange={(value) => setForm({ ...form, title: value })} />
@@ -1298,8 +1805,11 @@ function LoanFormView({
           <TextField label="返済期限" unit="年月日" type="date" value={form.due_date} onChange={(value) => setForm({ ...form, due_date: value })} />
           <NumberField label="分割回数" unit="回" value={form.installment_count} onChange={(value) => setForm({ ...form, installment_count: value })} />
           <NumberField label="月の返済額" unit="円" value={form.monthly_amount} onChange={(value) => setForm({ ...form, monthly_amount: value })} />
+          <SelectField label="返済日の種類" value={form.repayment_day_mode} onChange={(value) => setForm({ ...form, repayment_day_mode: value as "day" | "payday" })} options={[["day", "日付を指定"], ["payday", "給料日"]]} />
+          {form.repayment_day_mode === "day" && <NumberField label="返済予定日" unit="日" value={form.repayment_day} onChange={(value) => setForm({ ...form, repayment_day: value })} />}
+          <TextField label="メモ" unit="任意" value={form.memo} onChange={(value) => setForm({ ...form, memo: value })} />
         </div>
-        <button className="button primary form-submit" onClick={onSubmit}>登録する</button>
+        <button className="button primary form-submit" onClick={onSubmit}>{submitLabel}</button>
       </Panel>
     </section>
   );
@@ -1363,6 +1873,7 @@ function PersonalList({
                     setEditingEntryId(entry.id);
                     setEntryForm({
                       type: entry.type,
+                      entry_status: entry.entry_status || "confirmed",
                       title: entry.title,
                       amount: entry.amount,
                       entry_date: entry.entry_date,
