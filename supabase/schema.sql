@@ -64,7 +64,7 @@ create table if not exists public.loans (
   borrower_user_id uuid not null references auth.users(id) on delete cascade,
   principal_amount integer not null check (principal_amount >= 0),
   borrowed_at date not null,
-  due_date date not null,
+  due_date date,
   repayment_type text not null check (repayment_type in ('lump_sum', 'installment', 'flexible')),
   installment_count integer not null default 1 check (installment_count >= 1),
   monthly_amount integer not null default 0 check (monthly_amount >= 0),
@@ -155,6 +155,7 @@ alter table public.subscriptions alter column payer_user_id set not null;
 alter table public.loans add column if not exists repayment_day_mode text not null default 'day';
 alter table public.loans add column if not exists repayment_workplace_id uuid references public.workplaces(id) on delete set null;
 alter table public.loans add column if not exists memo text not null default '';
+alter table public.loans alter column due_date drop not null;
 alter table public.personal_entries add column if not exists entry_status text not null default 'confirmed';
 alter table public.personal_entries add column if not exists source_type text not null default 'manual';
 alter table public.personal_entries add column if not exists source_id uuid;
@@ -269,7 +270,8 @@ select
   coalesce(nullif(pm.display_name, ''), nullif(p.display_name, ''), 'メンバー') as display_name,
   pm.role,
   pm.joined_at,
-  pm.ended_at
+  pm.ended_at,
+  p.avatar_url
 from public.pair_members pm
 left join public.profiles p on p.id = pm.user_id
 where public.is_pair_member(pm.pair_id);
@@ -527,7 +529,20 @@ alter table public.workplaces enable row level security;
 
 drop policy if exists "profiles self select" on public.profiles;
 create policy "profiles self select" on public.profiles
-for select using (id = auth.uid());
+for select using (
+  id = (select auth.uid())
+  or exists (
+    select 1
+    from public.pair_members viewer
+    join public.pair_members target on target.pair_id = viewer.pair_id
+    join public.pairs pair on pair.id = viewer.pair_id
+    where viewer.user_id = (select auth.uid())
+      and viewer.ended_at is null
+      and target.user_id = profiles.id
+      and target.ended_at is null
+      and pair.deleted_at is null
+  )
+);
 
 drop policy if exists "profiles self upsert" on public.profiles;
 create policy "profiles self upsert" on public.profiles

@@ -19,7 +19,7 @@ export async function POST(request: NextRequest) {
 
   const [{ data: pair, error: pairError }, { data: members, error: membersError }] = await Promise.all([
     auth.supabase.from("pairs").select("id, name, icon_url, created_by, deleted_at, dissolution_requested_by, dissolution_requested_at").eq("id", pairId).maybeSingle(),
-    auth.supabase.from("pair_member_profiles").select("user_id, display_name, role").eq("pair_id", pairId).is("ended_at", null),
+    auth.supabase.from("pair_member_profiles").select("user_id, display_name, avatar_url, role").eq("pair_id", pairId).is("ended_at", null),
   ]);
 
   if (pairError) return jsonError(pairError.message, 400);

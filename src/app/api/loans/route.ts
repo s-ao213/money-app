@@ -28,7 +28,7 @@ export async function POST(request: NextRequest) {
   const repaymentType = ["lump_sum", "installment", "flexible"].includes(body?.repayment_type) ? body.repayment_type : "installment";
   const installmentCount = positiveInteger(body?.installment_count) || 1;
 
-  if (!pairId || !title || !amount || !borrowerUserId || !borrowedAt || !dueDate) {
+  if (!pairId || !title || !amount || !borrowerUserId || !borrowedAt) {
     return jsonError("貸し借り名、金額、借りた人、日付を正しく入力してください。", 422);
   }
 
@@ -41,10 +41,10 @@ export async function POST(request: NextRequest) {
       borrower_user_id: borrowerUserId,
       principal_amount: amount,
       borrowed_at: borrowedAt,
-      due_date: dueDate,
+      due_date: dueDate || null,
       repayment_type: repaymentType,
       installment_count: installmentCount,
-      monthly_amount: positiveInteger(body?.monthly_amount) || Math.ceil(amount / installmentCount),
+      monthly_amount: repaymentType === "installment" ? Math.floor(amount / installmentCount) : amount,
       repayment_day: positiveInteger(body?.repayment_day) || 25,
       repayment_day_mode: body?.repayment_day_mode === "payday" ? "payday" : "day",
       repayment_workplace_id: requiredString(body?.repayment_workplace_id),
