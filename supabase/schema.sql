@@ -14,7 +14,8 @@ create table if not exists public.pairs (
   icon_url text,
   invite_code_hash text not null unique,
   created_by uuid not null references auth.users(id) on delete cascade,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  deleted_at timestamptz
 );
 
 create table if not exists public.pair_members (
@@ -125,6 +126,7 @@ create table if not exists public.workplaces (
 
 alter table public.profiles add column if not exists avatar_url text;
 alter table public.pairs add column if not exists icon_url text;
+alter table public.pairs add column if not exists deleted_at timestamptz;
 alter table public.pair_members add column if not exists display_name text not null default '';
 alter table public.subscriptions alter column pair_id drop not null;
 alter table public.subscriptions add column if not exists created_by uuid default auth.uid() references auth.users(id) on delete cascade;
@@ -229,6 +231,22 @@ as $$
   );
 $$;
 
+create or replace function public.is_active_pair_member(pair_uuid uuid)
+returns boolean
+language sql
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.pair_members pm
+    join public.pairs p on p.id = pm.pair_id
+    where pm.pair_id = pair_uuid
+      and pm.user_id = auth.uid()
+      and p.deleted_at is null
+  );
+$$;
+
 create or replace view public.pair_member_profiles
 with (security_invoker = true)
 as
@@ -303,6 +321,7 @@ begin
   select id into target_pair_id
   from public.pairs
   where invite_code_hash = invite_hash
+    and deleted_at is null
   limit 1;
 
   if target_pair_id is null then
@@ -391,8 +410,9 @@ for select using (public.is_pair_member(id));
 
 drop policy if exists "pairs member update" on public.pairs;
 create policy "pairs member update" on public.pairs
-for update using (public.is_pair_member(id))
-with check (public.is_pair_member(id));
+for update to authenticated
+using (created_by = (select auth.uid()) and deleted_at is null)
+with check (created_by = (select auth.uid()));
 
 drop policy if exists "pair_members member select" on public.pair_members;
 create policy "pair_members member select" on public.pair_members
@@ -419,7 +439,7 @@ for insert with check (
     or (
       is_shared = true
       and pair_id is not null
-      and public.is_pair_member(pair_id)
+      and public.is_active_pair_member(pair_id)
       and public.is_user_in_pair(pair_id, owner_user_id)
       and public.is_user_in_pair(pair_id, payer_user_id)
     )
@@ -430,7 +450,7 @@ drop policy if exists "subscriptions member update" on public.subscriptions;
 create policy "subscriptions member update" on public.subscriptions
 for update using (
   (is_shared = false and created_by = auth.uid())
-  or (is_shared = true and pair_id is not null and public.is_pair_member(pair_id))
+  or (is_shared = true and pair_id is not null and public.is_active_pair_member(pair_id))
 )
 with check (
   created_by = auth.uid()
@@ -439,7 +459,7 @@ with check (
     or (
       is_shared = true
       and pair_id is not null
-      and public.is_pair_member(pair_id)
+      and public.is_active_pair_member(pair_id)
       and public.is_user_in_pair(pair_id, owner_user_id)
       and public.is_user_in_pair(pair_id, payer_user_id)
     )
@@ -450,7 +470,7 @@ drop policy if exists "subscriptions member delete" on public.subscriptions;
 create policy "subscriptions member delete" on public.subscriptions
 for delete using (
   (is_shared = false and created_by = auth.uid())
-  or (is_shared = true and pair_id is not null and public.is_pair_member(pair_id))
+  or (is_shared = true and pair_id is not null and public.is_active_pair_member(pair_id))
 );
 
 drop policy if exists "loans member select" on public.loans;
@@ -460,16 +480,16 @@ for select using (public.is_pair_member(pair_id));
 drop policy if exists "loans member insert" on public.loans;
 create policy "loans member insert" on public.loans
 for insert with check (
-  public.is_pair_member(pair_id)
+  public.is_active_pair_member(pair_id)
   and public.is_user_in_pair(pair_id, lender_user_id)
   and public.is_user_in_pair(pair_id, borrower_user_id)
 );
 
 drop policy if exists "loans member update" on public.loans;
 create policy "loans member update" on public.loans
-for update using (public.is_pair_member(pair_id) and lender_user_id = auth.uid())
+for update using (public.is_active_pair_member(pair_id) and lender_user_id = auth.uid())
 with check (
-  public.is_pair_member(pair_id)
+  public.is_active_pair_member(pair_id)
   and lender_user_id = auth.uid()
   and public.is_user_in_pair(pair_id, lender_user_id)
   and public.is_user_in_pair(pair_id, borrower_user_id)
@@ -477,7 +497,7 @@ with check (
 
 drop policy if exists "loans lender delete" on public.loans;
 create policy "loans lender delete" on public.loans
-for delete using (public.is_pair_member(pair_id) and lender_user_id = auth.uid());
+for delete using (public.is_active_pair_member(pair_id) and lender_user_id = auth.uid());
 
 drop policy if exists "loan_repayments member select" on public.loan_repayments;
 create policy "loan_repayments member select" on public.loan_repayments
@@ -526,7 +546,7 @@ create policy "personal categories insert" on public.personal_categories
 for insert to authenticated
 with check (
   user_id = (select auth.uid())
-  and (pair_id is null or public.is_pair_member(pair_id))
+  and (pair_id is null or public.is_active_pair_member(pair_id))
 );
 
 drop policy if exists "personal categories update" on public.personal_categories;
@@ -535,7 +555,7 @@ for update to authenticated
 using (user_id = (select auth.uid()))
 with check (
   user_id = (select auth.uid())
-  and (pair_id is null or public.is_pair_member(pair_id))
+  and (pair_id is null or public.is_active_pair_member(pair_id))
 );
 
 drop policy if exists "personal categories delete" on public.personal_categories;
@@ -579,10 +599,12 @@ revoke all on function public.is_pair_member(uuid) from public, anon;
 revoke all on function public.is_user_in_pair(uuid, uuid) from public, anon;
 grant execute on function public.is_pair_member(uuid) to authenticated;
 grant execute on function public.is_user_in_pair(uuid, uuid) to authenticated;
+revoke all on function public.is_active_pair_member(uuid) from public, anon;
+grant execute on function public.is_active_pair_member(uuid) to authenticated;
 drop function if exists public.create_pair_with_invite_hash(text, text, text);
 revoke all on function public.create_pair_with_invite_hash(text, text, text, text) from public, anon;
 revoke all on function public.join_pair_with_invite_hash(text, text) from public, anon;
 revoke all on function public.regenerate_pair_invite_hash(uuid, text) from public, anon;
 grant execute on function public.create_pair_with_invite_hash(text, text, text, text) to authenticated;
 grant execute on function public.join_pair_with_invite_hash(text, text) to authenticated;
-grant execute on function public.regenerate_pair_invite_hash(uuid, text) to authenticated;
+revoke all on function public.regenerate_pair_invite_hash(uuid, text) from authenticated;

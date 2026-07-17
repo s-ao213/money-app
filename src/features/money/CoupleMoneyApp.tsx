@@ -41,12 +41,14 @@ type MoneyType = "income" | "expense";
 type EntryStatus = "planned" | "confirmed";
 type SourceType = "manual" | "subscription" | "loan" | "repayment";
 
-type PairMember = { user_id: string; display_name: string };
+type PairMember = { user_id: string; display_name: string; role: "owner" | "member" };
 
 type PairInfo = {
   id: string;
   name: string;
   icon_url: string | null;
+  created_by: string;
+  deleted_at: string | null;
 };
 
 type PairApiState = {
@@ -441,6 +443,8 @@ function MoneyApp({
   const [repaymentDrafts, setRepaymentDrafts] = useState<Record<string, { amount: number; paid_at: string }>>({});
 
   const partner = members.find((member) => member.user_id !== user.id);
+  const pairDeleted = Boolean(pairInfo?.deleted_at);
+  const activePairId = pairDeleted ? null : pairId;
   const selfName = members.find((member) => member.user_id === user.id)?.display_name || displayName || "私";
   const partnerName = partner?.display_name || "相方";
 
@@ -451,9 +455,9 @@ function MoneyApp({
 
   useEffect(() => {
     if (view === "subscriptionNew") {
-      setSubscriptionForm({ ...subscriptionDefaults, is_shared: Boolean(pairId) });
+      setSubscriptionForm({ ...subscriptionDefaults, is_shared: Boolean(activePairId) });
     }
-  }, [pairId, view]);
+  }, [activePairId, view]);
 
   function markPending(action: string, label: string) {
     setPendingAction(action);
@@ -667,7 +671,7 @@ function MoneyApp({
   const selectedSubscription = subscriptions.find((subscription) => subscription.id === subscriptionId);
   const selectedEntry = entries.find((entry) => entry.id === entryId);
   const selectedLoan = loans.find((loan) => loan.id === loanId);
-  const canAddLoan = !loans.length || loans.some((loan) => loan.lender_user_id === user.id);
+  const canAddLoan = Boolean(activePairId) && (!loans.length || loans.some((loan) => loan.lender_user_id === user.id));
 
   useEffect(() => {
     if (view !== "subscriptionEdit" || !selectedSubscription) return;
@@ -729,7 +733,7 @@ function MoneyApp({
   }
 
   async function savePairSettings() {
-    if (!pairId) return;
+    if (!activePairId) return;
     if (!pairForm.name.trim() || !pairForm.displayName.trim()) {
       setMessage("ペア名とペア内の表示名を入力してください。");
       return;
@@ -738,7 +742,7 @@ function MoneyApp({
     try {
       await apiRequest("/api/pair", {
         method: "PATCH",
-        body: JSON.stringify({ pair_id: pairId, name: pairForm.name.trim(), display_name: pairForm.displayName.trim(), icon_url: pairForm.iconUrl || null }),
+        body: JSON.stringify({ pair_id: activePairId, name: pairForm.name.trim(), display_name: pairForm.displayName.trim(), icon_url: pairForm.iconUrl || null }),
       });
       setMessage("ペア設定を保存しました。");
       await refreshAll();
@@ -746,6 +750,24 @@ function MoneyApp({
       setMessage(error instanceof Error ? error.message : "ペア設定を保存できませんでした。");
     } finally {
       clearPending("savePairSettings");
+    }
+  }
+
+  async function deletePair() {
+    if (!activePairId) return;
+    if (!window.confirm("ペアを削除しますか？\n過去の共有支出・貸し借り・返済履歴は削除されず、引き続き参照できます。")) return;
+    markPending("deletePair", "ペアを削除");
+    try {
+      await apiRequest("/api/pair", {
+        method: "DELETE",
+        body: JSON.stringify({ pair_id: activePairId }),
+      });
+      setMessage("ペアを削除しました。過去のデータは引き続き参照できます。");
+      await refreshAll();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "ペアを削除できませんでした。");
+    } finally {
+      clearPending("deletePair");
     }
   }
 
@@ -827,25 +849,6 @@ function MoneyApp({
     }
   }
 
-  async function regenerateInvite() {
-    if (!pairId || partner) return;
-    const code = makeInviteCode();
-    const codeHash = await sha256(code);
-    markPending("regenerateInvite", "招待コードを発行");
-    try {
-      await apiRequest("/api/pair/invite", {
-        method: "PATCH",
-        body: JSON.stringify({ pair_id: pairId, invite_hash: codeHash }),
-      });
-      setInviteCode(code);
-      setMessage("新しい招待コードを発行しました。");
-    } catch (error) {
-      setMessage(error instanceof Error ? error.message : "招待コードを発行できませんでした。");
-    } finally {
-      clearPending("regenerateInvite");
-    }
-  }
-
   async function joinPair() {
     if (!displayName.trim() || !joinCode.trim()) {
       setMessage("表示名と招待コードを入力してください。");
@@ -887,7 +890,7 @@ function MoneyApp({
 
     return {
       ...subscriptionForm,
-      pair_id: subscriptionForm.is_shared ? pairId : null,
+      pair_id: subscriptionForm.is_shared ? activePairId : null,
       owner_user_id: subscriptionForm.is_shared ? personId(subscriptionForm.owner) : user.id,
       payer_user_id: subscriptionForm.is_shared ? personId(subscriptionForm.payer) : user.id,
       billing_day: billingDay,
@@ -901,7 +904,7 @@ function MoneyApp({
       setMessage("サブスク名と金額を入力してください。");
       return;
     }
-    if (subscriptionForm.is_shared && !pairId) {
+    if (subscriptionForm.is_shared && !activePairId) {
       setMessage("共有サブスクは先にペアを作成してください。");
       return;
     }
@@ -959,7 +962,7 @@ function MoneyApp({
   }
 
   async function addLoan() {
-    if (!pairId || !loanForm.title.trim() || loanForm.principal_amount <= 0) return;
+    if (!activePairId || !loanForm.title.trim() || loanForm.principal_amount <= 0) return;
     const lenderId = personId(loanForm.lender);
     const borrowerId = loanForm.lender === "me" ? personId("partner") : user.id;
     markPending("addLoan", "貸し借りを登録");
@@ -968,7 +971,7 @@ function MoneyApp({
         method: "POST",
         body: JSON.stringify({
           ...loanForm,
-          pair_id: pairId,
+          pair_id: activePairId,
           lender_user_id: lenderId,
           borrower_user_id: borrowerId,
         }),
@@ -1226,7 +1229,7 @@ function MoneyApp({
     try {
       await apiRequest<PersonalCategory>("/api/personal/categories", {
         method: "POST",
-        body: JSON.stringify({ pair_id: pairId, type: categoryForm.type, name: categoryForm.name.trim() }),
+        body: JSON.stringify({ pair_id: activePairId, type: categoryForm.type, name: categoryForm.name.trim() }),
       });
       setMessage("カテゴリを追加しました。");
       setCategoryForm({ type: "expense", name: "" });
@@ -1402,6 +1405,7 @@ function MoneyApp({
               loans={loans}
               canAddLoan={canAddLoan}
               currentUserId={user.id}
+              readOnly={pairDeleted}
               deleteLoan={deleteLoan}
               exportRows={() => exportWorkbook(loans, "貸し借り", `貸し借り_${selectedMonth}.xlsx`)}
             />
@@ -1411,7 +1415,7 @@ function MoneyApp({
         )}
 
         {view === "loanNew" && (
-          pairId ? <LoanFormView
+          activePairId ? <LoanFormView
             form={loanForm}
             setForm={setLoanForm}
             selfName={selfName}
@@ -1433,11 +1437,12 @@ function MoneyApp({
             addRepayment={addRepayment}
             currentUserId={user.id}
             deleteLoan={deleteLoan}
+            readOnly={pairDeleted}
           /> : <EmptyState text={pairResolved ? "ペアを作成すると貸し借り機能を使えます。" : "ペア情報を確認しています。"} />
         )}
 
         {view === "loanEdit" && (
-          pairId ? <LoanFormView
+          activePairId ? <LoanFormView
             form={loanForm}
             setForm={setLoanForm}
             selfName={selfName}
@@ -1501,6 +1506,7 @@ function MoneyApp({
             pairForm={pairForm}
             setPairForm={setPairForm}
             savePairSettings={savePairSettings}
+            deletePair={deletePair}
             members={members}
             currentUserId={user.id}
             pairId={pairId}
@@ -1510,7 +1516,6 @@ function MoneyApp({
             setJoinCode={setJoinCode}
             createPair={createPair}
             joinPair={joinPair}
-            regenerateInvite={regenerateInvite}
             changePassword={changePassword}
             signOut={() => supabase.auth.signOut()}
             setMessage={setMessage}
@@ -1788,12 +1793,14 @@ function LoansList({
   loans,
   canAddLoan,
   currentUserId,
+  readOnly,
   deleteLoan,
   exportRows,
 }: {
   loans: Loan[];
   canAddLoan: boolean;
   currentUserId: string;
+  readOnly: boolean;
   deleteLoan: (loanId: string) => void;
   exportRows: () => void;
 }) {
@@ -1806,7 +1813,7 @@ function LoansList({
       />
       <div className="ledger-list">
         {loans.map((loan) => {
-          const canManage = loan.lender_user_id === currentUserId;
+          const canManage = !readOnly && loan.lender_user_id === currentUserId;
           return (
             <div className="ledger-row action-row" key={loan.id}>
               <Link className="ledger-main clickable-row" href={`/loans/${loan.id}`}>
@@ -1846,6 +1853,7 @@ function LoanDetailView({
   addRepayment,
   currentUserId,
   deleteLoan,
+  readOnly,
 }: {
   loan?: Loan;
   selectedMonth: string;
@@ -1856,6 +1864,7 @@ function LoanDetailView({
   addRepayment: (loanId: string) => void;
   currentUserId: string;
   deleteLoan: (loanId: string) => void;
+  readOnly: boolean;
 }) {
   if (!loan) {
     return (
@@ -1868,7 +1877,7 @@ function LoanDetailView({
   const repaid = sum(loan.loan_repayments);
   const remaining = Math.max(0, loan.principal_amount - repaid);
   const draft = repaymentDrafts[loan.id] ?? { amount: 0, paid_at: "" };
-  const canManage = loan.lender_user_id === currentUserId;
+  const canManage = !readOnly && loan.lender_user_id === currentUserId;
   return (
     <section className="view">
       <PageHead
@@ -2216,6 +2225,7 @@ function MyPageView({
   pairForm,
   setPairForm,
   savePairSettings,
+  deletePair,
   members,
   currentUserId,
   pairId,
@@ -2225,7 +2235,6 @@ function MyPageView({
   setJoinCode,
   createPair,
   joinPair,
-  regenerateInvite,
   changePassword,
   signOut,
   setMessage,
@@ -2250,6 +2259,7 @@ function MyPageView({
   pairForm: { name: string; displayName: string; iconUrl: string };
   setPairForm: (form: { name: string; displayName: string; iconUrl: string }) => void;
   savePairSettings: () => void;
+  deletePair: () => void;
   members: PairMember[];
   currentUserId: string;
   pairId: string | null;
@@ -2259,7 +2269,6 @@ function MyPageView({
   setJoinCode: (value: string) => void;
   createPair: () => void;
   joinPair: () => void;
-  regenerateInvite: () => void;
   changePassword: () => void;
   signOut: () => void;
   setMessage: (message: string) => void;
@@ -2274,6 +2283,10 @@ function MyPageView({
   pendingAction: string | null;
   buttonLabel: (action: string, idle: string, busy?: string) => string;
 }) {
+  const [editingPair, setEditingPair] = useState(false);
+  const pairDeleted = Boolean(pairInfo?.deleted_at);
+  const canManagePair = Boolean(pairInfo && pairInfo.created_by === currentUserId && !pairDeleted);
+
   async function copyInviteCode() {
     if (!inviteCode) return;
     try {
@@ -2299,15 +2312,38 @@ function MyPageView({
         </div>
       </Panel>
 
-      <Panel title="ペア設定" action={pairId ? `${members.length}/2人` : "未設定"}>
+      <Panel title="ペア設定" action={pairDeleted ? "削除済み" : pairId ? `${members.length}/2人` : "未設定"}>
         {pairId ? (
           <>
-            <div className="stack-form pair-settings-form">
-              <ImagePicker label="グループアイコン" imageUrl={pairForm.iconUrl} onChange={(iconUrl) => setPairForm({ ...pairForm, iconUrl })} onMessage={setMessage} />
-              <TextField label="ペア名" unit="文字" value={pairForm.name} onChange={(name) => setPairForm({ ...pairForm, name })} />
-              <TextField label="ペア内で使用する自分の表示名" unit="文字" value={pairForm.displayName} onChange={(displayNameValue) => setPairForm({ ...pairForm, displayName: displayNameValue })} />
-              <button className="button primary" onClick={savePairSettings} disabled={Boolean(pendingAction)}><Save size={16} />{buttonLabel("savePairSettings", "ペア設定を保存", "保存中...")}</button>
+            <div className="pair-summary">
+              <div className="pair-summary-icon">
+                {pairInfo?.icon_url ? <img src={pairInfo.icon_url} alt="ペアアイコン" /> : <Users size={28} />}
+              </div>
+              <div className="pair-summary-copy">
+                <small>{pairDeleted ? "削除済みのペア" : "登録中のペア"}</small>
+                <strong>{pairInfo?.name || pairForm.name}</strong>
+                <span>{members.map((member) => member.display_name).join("・")}</span>
+              </div>
+              {canManagePair && !editingPair && (
+                <div className="icon-actions">
+                  <button className="icon-button" aria-label="ペア設定を編集" title="編集" onClick={() => setEditingPair(true)}><Pencil size={18} /></button>
+                  <button className="icon-button danger-icon" aria-label="ペアを削除" title="削除" disabled={Boolean(pendingAction)} onClick={deletePair}><Trash2 size={18} /></button>
+                </div>
+              )}
             </div>
+
+            {editingPair && canManagePair && (
+              <div className="stack-form pair-settings-form">
+                <ImagePicker label="ペアアイコン" imageUrl={pairForm.iconUrl} onChange={(iconUrl) => setPairForm({ ...pairForm, iconUrl })} onMessage={setMessage} />
+                <TextField label="ペア名" unit="文字" value={pairForm.name} onChange={(name) => setPairForm({ ...pairForm, name })} />
+                <TextField label="ペア内で使用する自分の表示名" unit="文字" value={pairForm.displayName} onChange={(displayNameValue) => setPairForm({ ...pairForm, displayName: displayNameValue })} />
+                <div className="button-row">
+                  <button className="button primary" onClick={() => { savePairSettings(); setEditingPair(false); }} disabled={Boolean(pendingAction)}><Save size={16} />{buttonLabel("savePairSettings", "保存する", "保存中...")}</button>
+                  <button className="button ghost" onClick={() => setEditingPair(false)}>キャンセル</button>
+                </div>
+              </div>
+            )}
+
             <div className="member-list">
               {members.map((member) => (
                 <div className="member-row" key={member.user_id}>
@@ -2317,13 +2353,13 @@ function MyPageView({
                 </div>
               ))}
             </div>
-            {!partner && (
+            {pairDeleted && <div className="notice">このペアは削除済みです。過去の共有支出、貸し借り、返済履歴は引き続き参照できます。</div>}
+            {!pairDeleted && !partner && inviteCode && (
               <>
                 <div className="button-row">
-                  <button className="button primary" onClick={regenerateInvite} disabled={Boolean(pendingAction)}>{buttonLabel("regenerateInvite", "招待コードを発行", "発行中...")}</button>
-                  {inviteCode && <button className="button ghost" onClick={copyInviteCode}><Copy size={16} />コピー</button>}
+                  <button className="button ghost" onClick={copyInviteCode}><Copy size={16} />作成時の招待コードをコピー</button>
                 </div>
-                {inviteCode && <div className="invite-code">{inviteCode}</div>}
+                <div className="invite-code">{inviteCode}</div>
               </>
             )}
           </>
