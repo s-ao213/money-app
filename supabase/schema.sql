@@ -15,7 +15,9 @@ create table if not exists public.pairs (
   invite_code_hash text not null unique,
   created_by uuid not null references auth.users(id) on delete cascade,
   created_at timestamptz not null default now(),
-  deleted_at timestamptz
+  deleted_at timestamptz,
+  dissolution_requested_by uuid references auth.users(id) on delete set null,
+  dissolution_requested_at timestamptz
 );
 
 create table if not exists public.pair_members (
@@ -25,6 +27,7 @@ create table if not exists public.pair_members (
   role text not null default 'member' check (role in ('owner', 'member')),
   display_name text not null default '',
   joined_at timestamptz not null default now(),
+  ended_at timestamptz,
   unique (pair_id, user_id)
 );
 
@@ -127,7 +130,14 @@ create table if not exists public.workplaces (
 alter table public.profiles add column if not exists avatar_url text;
 alter table public.pairs add column if not exists icon_url text;
 alter table public.pairs add column if not exists deleted_at timestamptz;
+alter table public.pairs add column if not exists dissolution_requested_by uuid references auth.users(id) on delete set null;
+alter table public.pairs add column if not exists dissolution_requested_at timestamptz;
 alter table public.pair_members add column if not exists display_name text not null default '';
+alter table public.pair_members add column if not exists ended_at timestamptz;
+update public.pair_members pm
+set ended_at = coalesce(pm.ended_at, p.deleted_at)
+from public.pairs p
+where p.id = pm.pair_id and p.deleted_at is not null and pm.ended_at is null;
 alter table public.subscriptions alter column pair_id drop not null;
 alter table public.subscriptions add column if not exists created_by uuid default auth.uid() references auth.users(id) on delete cascade;
 alter table public.subscriptions add column if not exists is_shared boolean not null default true;
@@ -164,9 +174,11 @@ create unique index if not exists personal_entries_generated_unique
 on public.personal_entries (user_id, source_type, source_id, period_key, scheduled_date)
 where source_type <> 'manual' and source_id is not null and period_key is not null and scheduled_date is not null;
 
--- A user keeps one permanent pair membership. This also makes pair lookup deterministic.
-create unique index if not exists pair_members_user_unique
-on public.pair_members (user_id);
+-- A user can belong to only one active pair while historical memberships remain readable.
+drop index if exists public.pair_members_user_unique;
+create unique index if not exists pair_members_active_user_unique
+on public.pair_members (user_id)
+where ended_at is null;
 
 create or replace function public.touch_updated_at()
 returns trigger
@@ -243,6 +255,7 @@ as $$
     join public.pairs p on p.id = pm.pair_id
     where pm.pair_id = pair_uuid
       and pm.user_id = auth.uid()
+      and pm.ended_at is null
       and p.deleted_at is null
   );
 $$;
@@ -255,7 +268,8 @@ select
   pm.user_id,
   coalesce(nullif(pm.display_name, ''), nullif(p.display_name, ''), 'メンバー') as display_name,
   pm.role,
-  pm.joined_at
+  pm.joined_at,
+  pm.ended_at
 from public.pair_members pm
 left join public.profiles p on p.id = pm.user_id
 where public.is_pair_member(pm.pair_id);
@@ -278,7 +292,7 @@ begin
     raise exception 'Not authenticated';
   end if;
 
-  if exists (select 1 from public.pair_members where user_id = auth.uid()) then
+  if exists (select 1 from public.pair_members where user_id = auth.uid() and ended_at is null) then
     raise exception 'すでにペアへ登録されています';
   end if;
 
@@ -314,7 +328,7 @@ begin
     raise exception 'Not authenticated';
   end if;
 
-  if exists (select 1 from public.pair_members where user_id = auth.uid()) then
+  if exists (select 1 from public.pair_members where user_id = auth.uid() and ended_at is null) then
     raise exception 'すでにペアへ登録されています';
   end if;
 
@@ -330,7 +344,8 @@ begin
 
   select count(*) into member_count
   from public.pair_members
-  where pair_id = target_pair_id;
+  where pair_id = target_pair_id
+    and ended_at is null;
 
   if member_count >= 2 and not public.is_pair_member(target_pair_id) then
     raise exception 'このペアはすでに2人で利用中です';
@@ -345,6 +360,120 @@ begin
   on conflict (pair_id, user_id) do nothing;
 
   return target_pair_id;
+end;
+$$;
+
+create or replace function public.update_pair_settings(
+  pair_id_input uuid,
+  pair_name text,
+  icon_url_input text,
+  display_name_input text
+)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if auth.uid() is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  if not public.is_active_pair_member(pair_id_input) then
+    raise exception '有効なペアのメンバーではありません';
+  end if;
+
+  update public.pairs
+  set name = coalesce(nullif(trim(pair_name), ''), 'ふたりの家計簿'),
+      icon_url = nullif(trim(icon_url_input), '')
+  where id = pair_id_input and deleted_at is null;
+
+  update public.pair_members
+  set display_name = coalesce(nullif(trim(display_name_input), ''), 'メンバー')
+  where pair_id = pair_id_input and user_id = auth.uid() and ended_at is null;
+end;
+$$;
+
+create or replace function public.request_or_confirm_pair_dissolution(pair_id_input uuid)
+returns text
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  pair_record public.pairs%rowtype;
+  active_member_count integer;
+begin
+  if auth.uid() is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  if not public.is_active_pair_member(pair_id_input) then
+    raise exception '有効なペアのメンバーではありません';
+  end if;
+
+  select * into pair_record
+  from public.pairs
+  where id = pair_id_input and deleted_at is null
+  for update;
+
+  if not found then
+    raise exception '有効なペアが見つかりません';
+  end if;
+
+  select count(*) into active_member_count
+  from public.pair_members
+  where pair_id = pair_id_input and ended_at is null;
+
+  if active_member_count <= 1 then
+    update public.pairs set deleted_at = now(), dissolution_requested_by = null, dissolution_requested_at = null
+    where id = pair_id_input;
+    update public.pair_members set ended_at = now()
+    where pair_id = pair_id_input and ended_at is null;
+    return 'dissolved';
+  end if;
+
+  if pair_record.dissolution_requested_by is null then
+    update public.pairs
+    set dissolution_requested_by = auth.uid(), dissolution_requested_at = now()
+    where id = pair_id_input;
+    return 'requested';
+  end if;
+
+  if pair_record.dissolution_requested_by = auth.uid() then
+    return 'pending';
+  end if;
+
+  update public.pairs
+  set deleted_at = now(), dissolution_requested_by = null, dissolution_requested_at = null
+  where id = pair_id_input;
+  update public.pair_members set ended_at = now()
+  where pair_id = pair_id_input and ended_at is null;
+  return 'dissolved';
+end;
+$$;
+
+create or replace function public.cancel_pair_dissolution(pair_id_input uuid)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if auth.uid() is null then
+    raise exception 'Not authenticated';
+  end if;
+
+  update public.pairs
+  set dissolution_requested_by = null, dissolution_requested_at = null
+  where id = pair_id_input
+    and deleted_at is null
+    and dissolution_requested_by = auth.uid()
+    and public.is_active_pair_member(pair_id_input);
+
+  if not found then
+    raise exception '解消申請を取り消せません';
+  end if;
 end;
 $$;
 
@@ -586,7 +715,8 @@ using (user_id = (select auth.uid()));
 
 grant usage on schema public to anon, authenticated;
 grant select, insert, update on public.profiles to authenticated;
-grant select, update on public.pairs to authenticated;
+revoke update on public.pairs from authenticated;
+grant select on public.pairs to authenticated;
 grant select, update on public.pair_members to authenticated;
 grant select, insert, update, delete on public.subscriptions to authenticated;
 grant select, insert, update, delete on public.loans to authenticated;
@@ -605,6 +735,12 @@ drop function if exists public.create_pair_with_invite_hash(text, text, text);
 revoke all on function public.create_pair_with_invite_hash(text, text, text, text) from public, anon;
 revoke all on function public.join_pair_with_invite_hash(text, text) from public, anon;
 revoke all on function public.regenerate_pair_invite_hash(uuid, text) from public, anon;
+revoke all on function public.update_pair_settings(uuid, text, text, text) from public, anon;
+revoke all on function public.request_or_confirm_pair_dissolution(uuid) from public, anon;
+revoke all on function public.cancel_pair_dissolution(uuid) from public, anon;
 grant execute on function public.create_pair_with_invite_hash(text, text, text, text) to authenticated;
 grant execute on function public.join_pair_with_invite_hash(text, text) to authenticated;
+grant execute on function public.update_pair_settings(uuid, text, text, text) to authenticated;
+grant execute on function public.request_or_confirm_pair_dissolution(uuid) to authenticated;
+grant execute on function public.cancel_pair_dissolution(uuid) to authenticated;
 revoke all on function public.regenerate_pair_invite_hash(uuid, text) from authenticated;

@@ -49,6 +49,8 @@ type PairInfo = {
   icon_url: string | null;
   created_by: string;
   deleted_at: string | null;
+  dissolution_requested_by: string | null;
+  dissolution_requested_at: string | null;
 };
 
 type PairApiState = {
@@ -558,14 +560,6 @@ function MoneyApp({
       setMessage(error instanceof Error ? error.message : "カテゴリを読み込めませんでした。");
     }
 
-    if (!nextPairId) {
-      window.localStorage.removeItem(pairStorageKey);
-      setMembers([]);
-      setLoans([]);
-      setPairInfo(null);
-      return;
-    }
-
     const currentPair = pairState.pair;
     const pairMembers = pairState.members || [];
     try {
@@ -575,8 +569,10 @@ function MoneyApp({
       setMessage(error instanceof Error ? error.message : "貸し借りを読み込めませんでした。");
     }
 
-    if (currentPair) setPairInfo(currentPair as PairInfo);
-    if (pairMembers.length) setMembers(pairMembers as PairMember[]);
+    if (!nextPairId) window.localStorage.removeItem(pairStorageKey);
+    setPairInfo(currentPair ? (currentPair as PairInfo) : null);
+    setMembers(pairMembers as PairMember[]);
+    if (!nextPairId) return;
     setPairForm({
       name: currentPair?.name || pairInfo?.name || "ふたりの家計簿",
       displayName: pairMembers?.find((member) => member.user_id === user.id)?.display_name || pairForm.displayName || profile?.display_name || "",
@@ -753,21 +749,44 @@ function MoneyApp({
     }
   }
 
-  async function deletePair() {
+  async function requestOrConfirmPairDissolution() {
     if (!activePairId) return;
-    if (!window.confirm("ペアを削除しますか？\n過去の共有支出・貸し借り・返済履歴は削除されず、引き続き参照できます。")) return;
-    markPending("deletePair", "ペアを削除");
+    const partnerRequested = pairInfo?.dissolution_requested_by && pairInfo.dissolution_requested_by !== user.id;
+    const prompt = partnerRequested
+      ? "相手からのペア解消申請に同意しますか？\n解消後も過去の共有支出・貸し借り・返済履歴は参照できます。"
+      : "ペアの解消を申請しますか？\n相手が同意すると解消されます。過去のデータは削除されません。";
+    if (!window.confirm(prompt)) return;
+    markPending("dissolvePair", partnerRequested ? "ペア解消に同意" : "ペア解消を申請");
     try {
-      await apiRequest("/api/pair", {
+      const result = await apiRequest<{ status: "requested" | "pending" | "dissolved" }>("/api/pair", {
         method: "DELETE",
         body: JSON.stringify({ pair_id: activePairId }),
       });
-      setMessage("ペアを削除しました。過去のデータは引き続き参照できます。");
       await refreshAll();
+      setMessage(result.status === "dissolved"
+        ? "ペアを解消しました。新しいペアを作成できます。過去のデータは引き続き参照できます。"
+        : "ペアの解消を申請しました。相手の同意を待っています。");
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "ペアを削除できませんでした。");
+      setMessage(error instanceof Error ? error.message : "ペアの解消手続きを進められませんでした。");
     } finally {
-      clearPending("deletePair");
+      clearPending("dissolvePair");
+    }
+  }
+
+  async function cancelPairDissolution() {
+    if (!activePairId) return;
+    markPending("cancelDissolution", "解消申請を取消");
+    try {
+      await apiRequest("/api/pair/dissolution", {
+        method: "DELETE",
+        body: JSON.stringify({ pair_id: activePairId }),
+      });
+      await refreshAll();
+      setMessage("ペアの解消申請を取り消しました。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "解消申請を取り消せませんでした。");
+    } finally {
+      clearPending("cancelDissolution");
     }
   }
 
@@ -1319,7 +1338,7 @@ function MoneyApp({
         <nav className="nav" onClick={() => setMenuOpen(false)}>
           <NavButton icon={<PieChart />} label="ダッシュボード" href="/" active={view === "dashboard"} />
           <NavButton icon={<RefreshCcw />} label="サブスク" href="/subscriptions" active={view.startsWith("subscription")} />
-          {pairId && <NavButton icon={<HandCoins />} label="貸し借り" href="/loans" active={view.startsWith("loan")} />}
+          {(pairId || loans.length > 0) && <NavButton icon={<HandCoins />} label="貸し借り" href="/loans" active={view.startsWith("loan")} />}
           <NavButton icon={<Banknote />} label="個人収支" href="/personal" active={view.startsWith("personal")} />
           <NavButton icon={<UserRound />} label="Myページ" href="/my-page" active={view === "myPage"} />
         </nav>
@@ -1400,12 +1419,12 @@ function MoneyApp({
         )}
 
         {view === "loans" && (
-          pairId ? (
+          (pairId || loans.length > 0) ? (
             <LoansList
               loans={loans}
               canAddLoan={canAddLoan}
               currentUserId={user.id}
-              readOnly={pairDeleted}
+              readOnly={!activePairId}
               deleteLoan={deleteLoan}
               exportRows={() => exportWorkbook(loans, "貸し借り", `貸し借り_${selectedMonth}.xlsx`)}
             />
@@ -1427,7 +1446,7 @@ function MoneyApp({
         )}
 
         {view === "loanDetail" && (
-          pairId ? <LoanDetailView
+          (pairId || selectedLoan) ? <LoanDetailView
             loan={selectedLoan}
             selectedMonth={selectedMonth}
             personLabel={personLabel}
@@ -1437,7 +1456,7 @@ function MoneyApp({
             addRepayment={addRepayment}
             currentUserId={user.id}
             deleteLoan={deleteLoan}
-            readOnly={pairDeleted}
+            readOnly={!activePairId}
           /> : <EmptyState text={pairResolved ? "ペアを作成すると貸し借り機能を使えます。" : "ペア情報を確認しています。"} />
         )}
 
@@ -1506,7 +1525,8 @@ function MoneyApp({
             pairForm={pairForm}
             setPairForm={setPairForm}
             savePairSettings={savePairSettings}
-            deletePair={deletePair}
+            requestOrConfirmPairDissolution={requestOrConfirmPairDissolution}
+            cancelPairDissolution={cancelPairDissolution}
             members={members}
             currentUserId={user.id}
             pairId={pairId}
@@ -2225,7 +2245,8 @@ function MyPageView({
   pairForm,
   setPairForm,
   savePairSettings,
-  deletePair,
+  requestOrConfirmPairDissolution,
+  cancelPairDissolution,
   members,
   currentUserId,
   pairId,
@@ -2259,7 +2280,8 @@ function MyPageView({
   pairForm: { name: string; displayName: string; iconUrl: string };
   setPairForm: (form: { name: string; displayName: string; iconUrl: string }) => void;
   savePairSettings: () => void;
-  deletePair: () => void;
+  requestOrConfirmPairDissolution: () => void;
+  cancelPairDissolution: () => void;
   members: PairMember[];
   currentUserId: string;
   pairId: string | null;
@@ -2284,8 +2306,9 @@ function MyPageView({
   buttonLabel: (action: string, idle: string, busy?: string) => string;
 }) {
   const [editingPair, setEditingPair] = useState(false);
-  const pairDeleted = Boolean(pairInfo?.deleted_at);
-  const canManagePair = Boolean(pairInfo && pairInfo.created_by === currentUserId && !pairDeleted);
+  const canManagePair = Boolean(pairInfo && !pairInfo.deleted_at);
+  const dissolutionRequestedByMe = pairInfo?.dissolution_requested_by === currentUserId;
+  const dissolutionRequestedByPartner = Boolean(pairInfo?.dissolution_requested_by && !dissolutionRequestedByMe);
 
   async function copyInviteCode() {
     if (!inviteCode) return;
@@ -2312,7 +2335,7 @@ function MyPageView({
         </div>
       </Panel>
 
-      <Panel title="ペア設定" action={pairDeleted ? "削除済み" : pairId ? `${members.length}/2人` : "未設定"}>
+      <Panel title="ペア設定" action={pairId ? `${members.length}/2人` : "未設定"}>
         {pairId ? (
           <>
             <div className="pair-summary">
@@ -2320,14 +2343,14 @@ function MyPageView({
                 {pairInfo?.icon_url ? <img src={pairInfo.icon_url} alt="ペアアイコン" /> : <Users size={28} />}
               </div>
               <div className="pair-summary-copy">
-                <small>{pairDeleted ? "削除済みのペア" : "登録中のペア"}</small>
+                <small>登録中のペア</small>
                 <strong>{pairInfo?.name || pairForm.name}</strong>
                 <span>{members.map((member) => member.display_name).join("・")}</span>
               </div>
               {canManagePair && !editingPair && (
                 <div className="icon-actions">
                   <button className="icon-button" aria-label="ペア設定を編集" title="編集" onClick={() => setEditingPair(true)}><Pencil size={18} /></button>
-                  <button className="icon-button danger-icon" aria-label="ペアを削除" title="削除" disabled={Boolean(pendingAction)} onClick={deletePair}><Trash2 size={18} /></button>
+                  <button className="icon-button danger-icon" aria-label="ペアを解消" title="解消" disabled={Boolean(pendingAction) || dissolutionRequestedByMe} onClick={requestOrConfirmPairDissolution}><Trash2 size={18} /></button>
                 </div>
               )}
             </div>
@@ -2353,8 +2376,23 @@ function MyPageView({
                 </div>
               ))}
             </div>
-            {pairDeleted && <div className="notice">このペアは削除済みです。過去の共有支出、貸し借り、返済履歴は引き続き参照できます。</div>}
-            {!pairDeleted && !partner && inviteCode && (
+            {dissolutionRequestedByMe && (
+              <div className="notice">
+                相手の同意待ちです。相手が同意するまでペアは解消されません。
+                <div className="button-row">
+                  <button className="button ghost" onClick={cancelPairDissolution} disabled={Boolean(pendingAction)}>{buttonLabel("cancelDissolution", "解消申請を取り消す", "取消中...")}</button>
+                </div>
+              </div>
+            )}
+            {dissolutionRequestedByPartner && (
+              <div className="notice">
+                相手からペア解消の申請があります。あなたが同意すると解消されます。
+                <div className="button-row">
+                  <button className="button danger" onClick={requestOrConfirmPairDissolution} disabled={Boolean(pendingAction)}>{buttonLabel("dissolvePair", "同意してペアを解消", "解消中...")}</button>
+                </div>
+              </div>
+            )}
+            {!partner && inviteCode && (
               <>
                 <div className="button-row">
                   <button className="button ghost" onClick={copyInviteCode}><Copy size={16} />作成時の招待コードをコピー</button>
