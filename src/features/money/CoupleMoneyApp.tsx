@@ -41,7 +41,7 @@ type MoneyType = "income" | "expense";
 type EntryStatus = "planned" | "confirmed";
 type SourceType = "manual" | "subscription" | "loan" | "repayment";
 
-type PairMember = { user_id: string; display_name: string; role: "owner" | "member" };
+type PairMember = { user_id: string; display_name: string; avatar_url: string | null; role: "owner" | "member" };
 
 type PairInfo = {
   id: string;
@@ -90,7 +90,7 @@ type Loan = {
   borrower_user_id: string;
   principal_amount: number;
   borrowed_at: string;
-  due_date: string;
+  due_date: string | null;
   repayment_type: RepaymentType;
   installment_count: number;
   monthly_amount: number;
@@ -222,7 +222,7 @@ const loanDefaults = {
   lender: "me" as Person,
   principal_amount: 0,
   borrowed_at: `${currentMonth}-01`,
-  due_date: `${currentMonth}-28`,
+  due_date: "",
   repayment_type: "installment" as RepaymentType,
   installment_count: 6,
   monthly_amount: 0,
@@ -269,7 +269,8 @@ function dateFor(month: string, day: number) {
 }
 
 function todayKey() {
-  return new Date().toISOString().slice(0, 10);
+  const value = new Date();
+  return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
 }
 
 function sum(rows: { amount: number }[]) {
@@ -334,9 +335,19 @@ function entryStatusForDate(date: string): EntryStatus {
 
 function scheduledLoanAmountForIndex(loan: Loan, index: number) {
   if (loan.repayment_type !== "installment") return loan.principal_amount;
-  const base = Math.floor(loan.principal_amount / loan.installment_count);
-  const remainder = loan.principal_amount % loan.installment_count;
-  return base + (index === loan.installment_count - 1 ? remainder : 0);
+  const count = Math.max(1, loan.installment_count);
+  const base = Math.floor(loan.principal_amount / count);
+  const remainder = loan.principal_amount % count;
+  return base + (index === 0 ? remainder : 0);
+}
+
+function repaymentDefaultFor(loan: Loan) {
+  const repaid = sum(loan.loan_repayments);
+  const remaining = Math.max(0, loan.principal_amount - repaid);
+  const amount = loan.repayment_type === "installment"
+    ? Math.min(scheduledLoanAmountForIndex(loan, Math.min(loan.loan_repayments.length, Math.max(0, loan.installment_count - 1))), remaining)
+    : remaining;
+  return { amount, paid_at: todayKey() };
 }
 
 export default function CoupleMoneyApp({
@@ -421,6 +432,7 @@ function MoneyApp({
   const pairStorageKey = `money-app:${user.id}:pair-id`;
   const [pairId, setPairId] = useState<string | null>(null);
   const [pairResolved, setPairResolved] = useState(false);
+  const [dataResolved, setDataResolved] = useState(false);
   const [pairInfo, setPairInfo] = useState<PairInfo | null>(null);
   const [members, setMembers] = useState<PairMember[]>([]);
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
@@ -443,12 +455,16 @@ function MoneyApp({
   const [editingCategoryId, setEditingCategoryId] = useState<string | null>(null);
   const [editingCategoryName, setEditingCategoryName] = useState("");
   const [repaymentDrafts, setRepaymentDrafts] = useState<Record<string, { amount: number; paid_at: string }>>({});
+  const [quickRepaymentOpen, setQuickRepaymentOpen] = useState(false);
+  const [quickRepaymentLoanId, setQuickRepaymentLoanId] = useState("");
 
   const partner = members.find((member) => member.user_id !== user.id);
   const pairDeleted = Boolean(pairInfo?.deleted_at);
   const activePairId = pairDeleted ? null : pairId;
   const selfName = members.find((member) => member.user_id === user.id)?.display_name || displayName || "私";
   const partnerName = partner?.display_name || "相方";
+  const selfAvatarUrl = members.find((member) => member.user_id === user.id)?.avatar_url || profileAvatarUrl || null;
+  const partnerAvatarUrl = partner?.avatar_url || null;
 
   useEffect(() => {
     if (view === "personalIncomeNew") setEntryForm(makeEntryDefaults("income"));
@@ -507,6 +523,8 @@ function MoneyApp({
   }
 
   async function refreshAll() {
+    setDataResolved(false);
+    try {
     setMessage("");
     const profile = await apiRequest<{ display_name: string; avatar_url: string | null }>("/api/profile");
     setDisplayName(profile?.display_name || "");
@@ -578,6 +596,9 @@ function MoneyApp({
       displayName: pairMembers?.find((member) => member.user_id === user.id)?.display_name || pairForm.displayName || profile?.display_name || "",
       iconUrl: currentPair?.icon_url || pairInfo?.icon_url || "",
     });
+    } finally {
+      setDataResolved(true);
+    }
   }
 
   useEffect(() => {
@@ -586,6 +607,19 @@ function MoneyApp({
     void refreshAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible" && !pendingAction) void refreshAll();
+    };
+    window.addEventListener("focus", refreshWhenVisible);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.removeEventListener("focus", refreshWhenVisible);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingAction]);
 
   async function refreshWithPending() {
     markPending("refreshAll", "更新");
@@ -699,7 +733,7 @@ function MoneyApp({
       lender: toPerson(selectedLoan.lender_user_id),
       principal_amount: selectedLoan.principal_amount,
       borrowed_at: selectedLoan.borrowed_at,
-      due_date: selectedLoan.due_date,
+      due_date: selectedLoan.due_date || "",
       repayment_type: selectedLoan.repayment_type,
       installment_count: selectedLoan.installment_count,
       monthly_amount: selectedLoan.monthly_amount,
@@ -931,10 +965,12 @@ function MoneyApp({
     }
     markPending("addSubscription", "サブスクを登録");
     try {
-      await apiRequest<Subscription>("/api/subscriptions", {
+      const created = await apiRequest<Subscription>("/api/subscriptions", {
         method: "POST",
         body: JSON.stringify(buildSubscriptionPayload()),
       });
+      setSubscriptions((current) => [created, ...current.filter((item) => item.id !== created.id)]);
+      await refreshAll();
       window.location.href = "/subscriptions";
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "サブスクを登録できませんでした。");
@@ -951,10 +987,12 @@ function MoneyApp({
     }
     markPending("updateSubscription", "サブスクを更新");
     try {
-      await apiRequest<Subscription>(`/api/subscriptions/${selectedSubscription.id}`, {
+      const updated = await apiRequest<Subscription>(`/api/subscriptions/${selectedSubscription.id}`, {
         method: "PATCH",
         body: JSON.stringify(buildSubscriptionPayload()),
       });
+      setSubscriptions((current) => current.map((item) => item.id === updated.id ? updated : item));
+      await refreshAll();
       setMessage("サブスクを更新しました。");
       window.location.href = `/subscriptions/${selectedSubscription.id}`;
     } catch (error) {
@@ -988,7 +1026,7 @@ function MoneyApp({
     const borrowerId = loanForm.lender === "me" ? personId("partner") : user.id;
     markPending("addLoan", "貸し借りを登録");
     try {
-      await apiRequest<Loan>("/api/loans", {
+      const created = await apiRequest<Loan>("/api/loans", {
         method: "POST",
         body: JSON.stringify({
           ...loanForm,
@@ -997,6 +1035,8 @@ function MoneyApp({
           borrower_user_id: borrowerId,
         }),
       });
+      setLoans((current) => [created, ...current.filter((item) => item.id !== created.id)]);
+      await refreshAll();
       window.location.href = "/loans";
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "貸し借りを登録できませんでした。");
@@ -1013,10 +1053,12 @@ function MoneyApp({
     }
     markPending("updateLoan", "貸し借りを更新");
     try {
-      await apiRequest<Loan>(`/api/loans/${selectedLoan.id}`, {
+      const updated = await apiRequest<Loan>(`/api/loans/${selectedLoan.id}`, {
         method: "PATCH",
         body: JSON.stringify(loanForm),
       });
+      setLoans((current) => current.map((item) => item.id === updated.id ? updated : item));
+      await refreshAll();
       setMessage("貸し借りを更新しました。");
       window.location.href = `/loans/${selectedLoan.id}`;
     } catch (error) {
@@ -1045,7 +1087,7 @@ function MoneyApp({
     if (!loan) return;
     const repaid = sum(loan.loan_repayments);
     const remaining = Math.max(0, loan.principal_amount - repaid);
-    const draft = repaymentDrafts[loanId] ?? { amount: 0, paid_at: "" };
+    const draft = repaymentDrafts[loanId] ?? repaymentDefaultFor(loan);
     if (draft.amount <= 0) {
       setMessage("返済金額を入力してください。");
       return;
@@ -1054,7 +1096,7 @@ function MoneyApp({
       setMessage("残金を超える返済金額は登録できません。");
       return;
     }
-    const paidAt = draft.paid_at || new Date().toISOString().slice(0, 10);
+    const paidAt = draft.paid_at || todayKey();
     markPending(`addRepayment:${loanId}`, "返済を登録");
     try {
       await apiRequest<Repayment>(`/api/loans/${loanId}/repayments`, {
@@ -1063,7 +1105,12 @@ function MoneyApp({
       });
       await confirmRepaymentEntries(loan, draft.amount, paidAt);
       setMessage("返済を登録しました。");
-      setRepaymentDrafts((current) => ({ ...current, [loanId]: { amount: 0, paid_at: "" } }));
+      setRepaymentDrafts((current) => {
+        const next = { ...current };
+        delete next[loanId];
+        return next;
+      });
+      setQuickRepaymentOpen(false);
       await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "返済を登録できませんでした。");
@@ -1217,6 +1264,12 @@ function MoneyApp({
 
     for (const entry of generated) {
       await upsertGeneratedEntry(entry);
+    }
+    try {
+      const personalEntries = await apiRequest<PersonalEntry[]>("/api/personal/entries");
+      setEntries(personalEntries || []);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "予定収支を再読み込みできませんでした。");
     }
   }
 
@@ -1404,7 +1457,7 @@ function MoneyApp({
         )}
 
         {view === "subscriptions" && (
-          <SubscriptionsList
+          !dataResolved ? <LoadingState text="サブスクを読み込んでいます。" /> : <SubscriptionsList
             subscriptions={subscriptions}
             selectedMonth={selectedMonth}
             personLabel={personLabel}
@@ -1422,6 +1475,8 @@ function MoneyApp({
             setForm={setSubscriptionForm}
             selfName={selfName}
             partnerName={partnerName}
+            selfAvatarUrl={selfAvatarUrl}
+            partnerAvatarUrl={partnerAvatarUrl}
             onSubmit={addSubscription}
             disabled={Boolean(pendingAction)}
             submitLabel={buttonLabel("addSubscription", "登録する", "登録中...")}
@@ -1429,7 +1484,7 @@ function MoneyApp({
         )}
 
         {view === "subscriptionDetail" && (
-          <SubscriptionDetailView
+          !dataResolved ? <LoadingState text="サブスク詳細を読み込んでいます。" /> : <SubscriptionDetailView
             subscription={selectedSubscription}
             selectedMonth={selectedMonth}
             personLabel={personLabel}
@@ -1446,6 +1501,8 @@ function MoneyApp({
             setForm={setSubscriptionForm}
             selfName={selfName}
             partnerName={partnerName}
+            selfAvatarUrl={selfAvatarUrl}
+            partnerAvatarUrl={partnerAvatarUrl}
             onSubmit={updateSubscription}
             title="サブスク編集"
             submitLabel={buttonLabel("updateSubscription", "更新する", "更新中...")}
@@ -1454,12 +1511,19 @@ function MoneyApp({
         )}
 
         {view === "loans" && (
-          (pairId || loans.length > 0) ? (
+          !dataResolved ? <LoadingState text="貸し借りを読み込んでいます。" /> : (pairId || loans.length > 0) ? (
             <LoansList
               loans={loans}
               canAddLoan={canAddLoan}
               currentUserId={user.id}
               activePairId={activePairId}
+              repaymentDrafts={repaymentDrafts}
+              setRepaymentDrafts={setRepaymentDrafts}
+              addRepayment={addRepayment}
+              quickRepaymentOpen={quickRepaymentOpen}
+              setQuickRepaymentOpen={setQuickRepaymentOpen}
+              quickRepaymentLoanId={quickRepaymentLoanId}
+              setQuickRepaymentLoanId={setQuickRepaymentLoanId}
               deleteLoan={deleteLoan}
               pendingAction={pendingAction}
               buttonLabel={buttonLabel}
@@ -1483,7 +1547,7 @@ function MoneyApp({
         )}
 
         {view === "loanDetail" && (
-          (pairId || selectedLoan) ? <LoanDetailView
+          !dataResolved ? <LoadingState text="貸し借り詳細を読み込んでいます。" /> : (pairId || selectedLoan) ? <LoanDetailView
             loan={selectedLoan}
             selectedMonth={selectedMonth}
             personLabel={personLabel}
@@ -1783,6 +1847,8 @@ function SubscriptionFormView({
   setForm,
   selfName,
   partnerName,
+  selfAvatarUrl,
+  partnerAvatarUrl,
   onSubmit,
   title = "サブスク追加",
   submitLabel = "登録する",
@@ -1792,6 +1858,8 @@ function SubscriptionFormView({
   setForm: (form: typeof subscriptionDefaults) => void;
   selfName: string;
   partnerName: string;
+  selfAvatarUrl: string | null;
+  partnerAvatarUrl: string | null;
   onSubmit: () => void;
   title?: string;
   submitLabel?: React.ReactNode;
@@ -1808,13 +1876,19 @@ function SubscriptionFormView({
           <NumberField label="金額" unit={form.billing_cycle === "weekly" ? "円/週" : form.billing_cycle === "yearly" ? "円/年" : "円/月"} value={form.amount} onChange={(value) => setForm({ ...form, amount: value })} />
           {form.is_shared ? (
             <>
-              <SelectField label="契約者" value={form.owner} onChange={(value) => setForm({ ...form, owner: value as Person })} options={[["me", selfName], ["partner", partnerName]]} />
-              <SelectField label="実際に支払う人" value={form.payer} onChange={(value) => setForm({ ...form, payer: value as Person })} options={[["me", selfName], ["partner", partnerName]]} />
+              <PersonChoiceField label="契約者" value={form.owner} onChange={(value) => setForm({ ...form, owner: value })} choices={[
+                { value: "me", label: selfName, avatarUrl: selfAvatarUrl },
+                { value: "partner", label: partnerName, avatarUrl: partnerAvatarUrl },
+              ]} />
+              <PersonChoiceField label="実際に支払う人" value={form.payer} onChange={(value) => setForm({ ...form, payer: value })} choices={[
+                { value: "me", label: selfName, avatarUrl: selfAvatarUrl },
+                { value: "partner", label: partnerName, avatarUrl: partnerAvatarUrl },
+              ]} />
             </>
           ) : (
             <>
-              <div className="readonly-field"><span>契約者</span><strong>{selfName}</strong></div>
-              <div className="readonly-field"><span>実際に支払う人</span><strong>{selfName}</strong></div>
+              <div className="readonly-field"><span>契約者</span><strong className="person-inline"><MemberAvatar name={selfName} avatarUrl={selfAvatarUrl} />{selfName}</strong></div>
+              <div className="readonly-field"><span>実際に支払う人</span><strong className="person-inline"><MemberAvatar name={selfName} avatarUrl={selfAvatarUrl} />{selfName}</strong></div>
             </>
           )}
           {form.billing_cycle === "monthly" ? (
@@ -1863,6 +1937,13 @@ function LoansList({
   canAddLoan,
   currentUserId,
   activePairId,
+  repaymentDrafts,
+  setRepaymentDrafts,
+  addRepayment,
+  quickRepaymentOpen,
+  setQuickRepaymentOpen,
+  quickRepaymentLoanId,
+  setQuickRepaymentLoanId,
   deleteLoan,
   pendingAction,
   buttonLabel,
@@ -1872,18 +1953,60 @@ function LoansList({
   canAddLoan: boolean;
   currentUserId: string;
   activePairId: string | null;
+  repaymentDrafts: Record<string, { amount: number; paid_at: string }>;
+  setRepaymentDrafts: (drafts: Record<string, { amount: number; paid_at: string }>) => void;
+  addRepayment: (loanId: string) => void;
+  quickRepaymentOpen: boolean;
+  setQuickRepaymentOpen: (open: boolean) => void;
+  quickRepaymentLoanId: string;
+  setQuickRepaymentLoanId: (id: string) => void;
   deleteLoan: (loanId: string) => void;
   pendingAction: string | null;
   buttonLabel: (action: string, idle: string, busy?: string) => React.ReactNode;
   exportRows: () => void;
 }) {
+  const repayableLoans = loans.filter((loan) =>
+    loan.pair_id === activePairId
+    && loan.lender_user_id === currentUserId
+    && (loan.status === "active" || loan.status === "overdue")
+    && sum(loan.loan_repayments) < loan.principal_amount
+  );
+  const selectedRepaymentLoan = repayableLoans.find((loan) => loan.id === quickRepaymentLoanId) || repayableLoans[0];
+  const repaymentDraft = selectedRepaymentLoan
+    ? repaymentDrafts[selectedRepaymentLoan.id] ?? repaymentDefaultFor(selectedRepaymentLoan)
+    : null;
+
+  function openRepaymentForm() {
+    if (!selectedRepaymentLoan) return;
+    setQuickRepaymentLoanId(selectedRepaymentLoan.id);
+    setQuickRepaymentOpen(true);
+  }
+
   return (
     <section className="view">
       <PageHead
         title="貸し借り一覧"
         backHref="/"
-        actions={<>{canAddLoan && <Link className="button primary" href="/loans/new"><Plus size={16} />追加</Link>}<button className="button ghost" disabled={Boolean(pendingAction)} onClick={exportRows}>{pendingAction !== "exportLoans" && <Download size={16} />}{buttonLabel("exportLoans", "Excel", "作成中...")}</button></>}
+        actions={<>{canAddLoan && <Link className="button primary" href="/loans/new"><Plus size={16} />追加</Link>}{repayableLoans.length > 0 && <button className="button dark" disabled={Boolean(pendingAction)} onClick={openRepaymentForm}><CheckCircle2 size={16} />返済登録</button>}<button className="button ghost" disabled={Boolean(pendingAction)} onClick={exportRows}>{pendingAction !== "exportLoans" && <Download size={16} />}{buttonLabel("exportLoans", "Excel", "作成中...")}</button></>}
       />
+      {quickRepaymentOpen && selectedRepaymentLoan && repaymentDraft && (
+        <Panel title="返済登録" action="貸した人だけが登録できます">
+          <div className="stack-form quick-repayment-form">
+            <SelectField
+              label="進行中の貸し借り"
+              value={selectedRepaymentLoan.id}
+              onChange={(id) => setQuickRepaymentLoanId(id)}
+              options={repayableLoans.map((loan) => [loan.id, `${loan.title}（残金 ${yen.format(Math.max(0, loan.principal_amount - sum(loan.loan_repayments))) }）`])}
+            />
+            <NumberField label="返済金額" unit="円・変更可" value={repaymentDraft.amount} onChange={(amount) => setRepaymentDrafts({ ...repaymentDrafts, [selectedRepaymentLoan.id]: { ...repaymentDraft, amount } })} />
+            <TextField label="返済日" unit="年月日" type="date" value={repaymentDraft.paid_at} onChange={(paid_at) => setRepaymentDrafts({ ...repaymentDrafts, [selectedRepaymentLoan.id]: { ...repaymentDraft, paid_at } })} />
+            <div className="button-row">
+              <button className="button dark" disabled={Boolean(pendingAction)} onClick={() => addRepayment(selectedRepaymentLoan.id)}>{pendingAction !== `addRepayment:${selectedRepaymentLoan.id}` && <CheckCircle2 size={16} />}{buttonLabel(`addRepayment:${selectedRepaymentLoan.id}`, "返済を登録", "登録中...")}</button>
+              <button className="button ghost" disabled={Boolean(pendingAction)} onClick={() => setQuickRepaymentOpen(false)}>キャンセル</button>
+            </div>
+          </div>
+        </Panel>
+      )}
       <div className="ledger-list">
         {loans.map((loan) => {
           const canManage = loan.pair_id === activePairId && loan.lender_user_id === currentUserId;
@@ -1953,7 +2076,7 @@ function LoanDetailView({
   }
   const repaid = sum(loan.loan_repayments);
   const remaining = Math.max(0, loan.principal_amount - repaid);
-  const draft = repaymentDrafts[loan.id] ?? { amount: 0, paid_at: "" };
+  const draft = repaymentDrafts[loan.id] ?? repaymentDefaultFor(loan);
   const canManage = !readOnly && loan.lender_user_id === currentUserId;
   return (
     <section className="view">
@@ -1979,7 +2102,7 @@ function LoanDetailView({
         <Panel title="返済登録" action="金額のみで登録できます">
           <div className="repayment-form detail-repayment-form">
             <NumberField label="返済金額" unit="円" value={draft.amount} onChange={(amount) => setRepaymentDrafts({ ...repaymentDrafts, [loan.id]: { ...draft, amount } })} />
-            <TextField label="返済日" unit="年月日・任意" type="date" value={draft.paid_at} onChange={(paid_at) => setRepaymentDrafts({ ...repaymentDrafts, [loan.id]: { ...draft, paid_at } })} />
+            <TextField label="返済日" unit="年月日" type="date" value={draft.paid_at} onChange={(paid_at) => setRepaymentDrafts({ ...repaymentDrafts, [loan.id]: { ...draft, paid_at } })} />
             <button className="button dark" disabled={Boolean(pendingAction)} onClick={() => addRepayment(loan.id)}>{pendingAction !== `addRepayment:${loan.id}` && <CheckCircle2 size={16} />}{buttonLabel(`addRepayment:${loan.id}`, "返済登録", "登録中...")}</button>
           </div>
         </Panel>
@@ -2026,6 +2149,10 @@ function LoanFormView({
   submitLabel?: React.ReactNode;
   disabled?: boolean;
 }) {
+  const installmentCount = Math.max(1, form.installment_count);
+  const regularInstallment = Math.floor(form.principal_amount / installmentCount);
+  const firstInstallment = regularInstallment + (form.principal_amount % installmentCount);
+
   return (
     <section className="view">
       <PageHead title={title} backHref="/loans" />
@@ -2036,9 +2163,18 @@ function LoanFormView({
           <div className="readonly-field"><span>貸した人</span><strong>{selfName}</strong></div>
           <SelectField label="返済方法" value={form.repayment_type} onChange={(value) => setForm({ ...form, repayment_type: value as RepaymentType })} options={[["installment", "分割"], ["lump_sum", "一括"], ["flexible", "任意"]]} />
           <TextField label="借りた日" type="date" value={form.borrowed_at} onChange={(value) => setForm({ ...form, borrowed_at: value })} />
-          <TextField label="返済期限" unit="年月日" type="date" value={form.due_date} onChange={(value) => setForm({ ...form, due_date: value })} />
-          <NumberField label="分割回数" unit="回" value={form.installment_count} onChange={(value) => setForm({ ...form, installment_count: value })} />
-          <NumberField label="月の返済額" unit="円" value={form.monthly_amount} onChange={(value) => setForm({ ...form, monthly_amount: value })} />
+          <TextField label="返済期限" unit="任意" type="date" value={form.due_date} onChange={(value) => setForm({ ...form, due_date: value })} />
+          {form.repayment_type === "installment" && (
+            <>
+              <NumberField label="分割回数" unit="回" value={form.installment_count} onChange={(value) => setForm({ ...form, installment_count: Math.max(1, value), monthly_amount: Math.floor(form.principal_amount / Math.max(1, value)) })} />
+              <div className="installment-preview" aria-live="polite">
+                <span>自動計算した分割金額</span>
+                <strong>初回 {yen.format(firstInstallment)}</strong>
+                {installmentCount > 1 && <small>2回目以降 {yen.format(regularInstallment)} × {installmentCount - 1}回</small>}
+                {form.principal_amount % installmentCount > 0 && <small>割り切れない端数は初回に加えています。</small>}
+              </div>
+            </>
+          )}
           <SelectField label="返済日の種類" value={form.repayment_day_mode} onChange={(value) => setForm({ ...form, repayment_day_mode: value as "day" | "payday" })} options={[["day", "日付を指定"], ["payday", "給料日"]]} />
           {form.repayment_day_mode === "day" && <NumberField label="返済予定日" unit="日" value={form.repayment_day} onChange={(value) => setForm({ ...form, repayment_day: value })} />}
           <TextField label="メモ" unit="任意" value={form.memo} onChange={(value) => setForm({ ...form, memo: value })} />
@@ -2095,7 +2231,7 @@ function PersonalList({
           <div className="ledger-edit-block" key={entry.id}>
             <div className="ledger-row action-row">
               <Link className="ledger-main clickable-row" href={`/personal/${entry.id}`}>
-                <span className={entry.type === "income" ? "pill blue" : "pill red"}>{entry.type === "income" ? "収入" : "支出"}</span>
+                <span className={entry.entry_status === "planned" ? "pill green" : entry.type === "income" ? "pill blue" : "pill red"}>{entry.entry_status === "planned" ? "予定" : entry.type === "income" ? "収入" : "支出"}</span>
                 <div>
                   <strong>{entry.title}</strong>
                   <small>{entry.entry_date} / {entry.category}{entry.source ? ` / ${entry.source}` : ""}</small>
@@ -2437,7 +2573,7 @@ function MyPageView({
             <div className="member-list">
               {members.map((member) => (
                 <div className="member-row" key={member.user_id}>
-                  <UserRound size={18} />
+                  <MemberAvatar name={member.display_name} avatarUrl={member.avatar_url} />
                   <strong>{member.display_name}</strong>
                   <span>{member.user_id === currentUserId ? "あなた" : "相方"}</span>
                 </div>
@@ -2546,14 +2682,14 @@ function MyPageView({
 function scheduledLoanAmount(loan: Loan, month: string) {
   if (month < monthOf(loan.borrowed_at)) return 0;
   if (loan.repayment_type === "flexible") return 0;
-  if (loan.repayment_type === "lump_sum") return monthOf(loan.due_date) === month ? loan.principal_amount : 0;
+  if (loan.repayment_type === "lump_sum") return loan.due_date && monthOf(loan.due_date) === month ? loan.principal_amount : 0;
   const start = new Date(`${monthOf(loan.borrowed_at)}-01T00:00:00`);
   const current = new Date(`${month}-01T00:00:00`);
   const index = (current.getFullYear() - start.getFullYear()) * 12 + current.getMonth() - start.getMonth();
   if (index < 0 || index >= loan.installment_count) return 0;
   const paidBeforeMonth = sum(loan.loan_repayments.filter((repayment) => monthOf(repayment.paid_at) < month));
   const remaining = Math.max(0, loan.principal_amount - paidBeforeMonth);
-  return Math.min(loan.monthly_amount || Math.ceil(loan.principal_amount / loan.installment_count), remaining);
+  return Math.min(scheduledLoanAmountForIndex(loan, index), remaining);
 }
 
 function AuthScreen({ supabase }: { supabase: SupabaseClient }) {
@@ -2625,6 +2761,10 @@ function PageHead({ title, backHref, actions }: { title: string; backHref?: stri
 
 function EmptyState({ text }: { text: string }) {
   return <div className="empty-state">{text}</div>;
+}
+
+function LoadingState({ text }: { text: string }) {
+  return <div className="loading-state" role="status"><ButtonSpinner />{text}</div>;
 }
 
 function FullPageMessage({ title, body }: { title: string; body: string }) {
@@ -2739,6 +2879,45 @@ function SelectField({ label, value, options, onChange }: { label: string; value
         ))}
       </select>
     </label>
+  );
+}
+
+function MemberAvatar({ name, avatarUrl }: { name: string; avatarUrl?: string | null }) {
+  return avatarUrl
+    ? <img className="member-avatar" src={avatarUrl} alt={`${name}のアイコン`} />
+    : <span className="member-avatar avatar-fallback" aria-hidden="true"><UserRound size={18} /></span>;
+}
+
+function PersonChoiceField({
+  label,
+  value,
+  choices,
+  onChange,
+}: {
+  label: string;
+  value: Person;
+  choices: { value: Person; label: string; avatarUrl: string | null }[];
+  onChange: (value: Person) => void;
+}) {
+  return (
+    <fieldset className="person-choice-field">
+      <legend>{label}</legend>
+      <div className="person-choice-grid">
+        {choices.map((choice) => (
+          <button
+            key={choice.value}
+            type="button"
+            className={`person-choice ${value === choice.value ? "selected" : ""}`}
+            aria-pressed={value === choice.value}
+            onClick={() => onChange(choice.value)}
+          >
+            <MemberAvatar name={choice.label} avatarUrl={choice.avatarUrl} />
+            <strong>{choice.label}</strong>
+            <span>{value === choice.value ? "選択中" : "選ぶ"}</span>
+          </button>
+        ))}
+      </div>
+    </fieldset>
   );
 }
 

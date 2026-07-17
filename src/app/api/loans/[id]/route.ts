@@ -27,10 +27,10 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
     .update({
       title,
       principal_amount: amount,
-      due_date: requiredString(body?.due_date),
+      due_date: requiredString(body?.due_date) || null,
       repayment_type: ["lump_sum", "installment", "flexible"].includes(body?.repayment_type) ? body.repayment_type : "installment",
       installment_count: positiveInteger(body?.installment_count) || 1,
-      monthly_amount: positiveInteger(body?.monthly_amount) || 0,
+      monthly_amount: body?.repayment_type === "installment" ? Math.floor(amount / (positiveInteger(body?.installment_count) || 1)) : amount,
       repayment_day: positiveInteger(body?.repayment_day) || 25,
       repayment_day_mode: body?.repayment_day_mode === "payday" ? "payday" : "day",
       repayment_workplace_id: requiredString(body?.repayment_workplace_id),
