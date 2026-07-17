@@ -2306,7 +2306,9 @@ function MyPageView({
   buttonLabel: (action: string, idle: string, busy?: string) => string;
 }) {
   const [editingPair, setEditingPair] = useState(false);
-  const canManagePair = Boolean(pairInfo && !pairInfo.deleted_at);
+  // The active membership is the source of truth for showing pair actions.
+  // Keep these actions visible even while editing or while pair details refresh.
+  const canManagePair = Boolean(pairId);
   const dissolutionRequestedByMe = pairInfo?.dissolution_requested_by === currentUserId;
   const dissolutionRequestedByPartner = Boolean(pairInfo?.dissolution_requested_by && !dissolutionRequestedByMe);
 
@@ -2347,10 +2349,10 @@ function MyPageView({
                 <strong>{pairInfo?.name || pairForm.name}</strong>
                 <span>{members.map((member) => member.display_name).join("・")}</span>
               </div>
-              {canManagePair && !editingPair && (
+              {canManagePair && (
                 <div className="icon-actions">
-                  <button className="icon-button" aria-label="ペア設定を編集" title="編集" onClick={() => setEditingPair(true)}><Pencil size={18} /></button>
-                  <button className="icon-button danger-icon" aria-label="ペアを解消" title="解消" disabled={Boolean(pendingAction) || dissolutionRequestedByMe} onClick={requestOrConfirmPairDissolution}><Trash2 size={18} /></button>
+                  <button className="icon-button" aria-label="ペア設定を編集" title="編集" disabled={Boolean(pendingAction)} onClick={() => setEditingPair(true)}><Pencil size={18} /></button>
+                  <button className="icon-button danger-icon" aria-label="ペアを削除（解消申請）" title="削除" disabled={Boolean(pendingAction) || dissolutionRequestedByMe} onClick={requestOrConfirmPairDissolution}><Trash2 size={18} /></button>
                 </div>
               )}
             </div>
