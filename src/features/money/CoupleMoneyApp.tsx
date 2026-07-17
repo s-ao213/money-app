@@ -667,7 +667,7 @@ function MoneyApp({
   const selectedSubscription = subscriptions.find((subscription) => subscription.id === subscriptionId);
   const selectedEntry = entries.find((entry) => entry.id === entryId);
   const selectedLoan = loans.find((loan) => loan.id === loanId);
-  const canAddLoan = Boolean(activePairId) && (!loans.length || loans.some((loan) => loan.lender_user_id === user.id));
+  const canAddLoan = Boolean(activePairId);
 
   useEffect(() => {
     if (view !== "subscriptionEdit" || !selectedSubscription) return;
@@ -1424,7 +1424,7 @@ function MoneyApp({
               loans={loans}
               canAddLoan={canAddLoan}
               currentUserId={user.id}
-              readOnly={!activePairId}
+              activePairId={activePairId}
               deleteLoan={deleteLoan}
               exportRows={() => exportWorkbook(loans, "貸し借り", `貸し借り_${selectedMonth}.xlsx`)}
             />
@@ -1456,7 +1456,7 @@ function MoneyApp({
             addRepayment={addRepayment}
             currentUserId={user.id}
             deleteLoan={deleteLoan}
-            readOnly={!activePairId}
+            readOnly={selectedLoan?.pair_id !== activePairId}
           /> : <EmptyState text={pairResolved ? "ペアを作成すると貸し借り機能を使えます。" : "ペア情報を確認しています。"} />
         )}
 
@@ -1813,14 +1813,14 @@ function LoansList({
   loans,
   canAddLoan,
   currentUserId,
-  readOnly,
+  activePairId,
   deleteLoan,
   exportRows,
 }: {
   loans: Loan[];
   canAddLoan: boolean;
   currentUserId: string;
-  readOnly: boolean;
+  activePairId: string | null;
   deleteLoan: (loanId: string) => void;
   exportRows: () => void;
 }) {
@@ -1833,7 +1833,7 @@ function LoansList({
       />
       <div className="ledger-list">
         {loans.map((loan) => {
-          const canManage = !readOnly && loan.lender_user_id === currentUserId;
+          const canManage = loan.pair_id === activePairId && loan.lender_user_id === currentUserId;
           return (
             <div className="ledger-row action-row" key={loan.id}>
               <Link className="ledger-main clickable-row" href={`/loans/${loan.id}`}>
