@@ -16,8 +16,8 @@ export async function GET(request: NextRequest) {
   if (!pairId) return jsonOk({ pair_id: null, pair: null, members: [] });
 
   const [{ data: pair, error: pairError }, { data: members, error: membersError }] = await Promise.all([
-    auth.supabase.from("pairs").select("id, name, icon_url").eq("id", pairId).maybeSingle(),
-    auth.supabase.from("pair_member_profiles").select("user_id, display_name").eq("pair_id", pairId),
+    auth.supabase.from("pairs").select("id, name, icon_url, created_by, deleted_at").eq("id", pairId).maybeSingle(),
+    auth.supabase.from("pair_member_profiles").select("user_id, display_name, role").eq("pair_id", pairId),
   ]);
 
   if (pairError) return jsonError(pairError.message, 400);
@@ -55,8 +55,8 @@ export async function POST(request: NextRequest) {
   if (!pairId) return jsonOk({ pair_id: null, pair: null, members: [] }, { status: 201 });
 
   const [{ data: pair, error: pairError }, { data: members, error: membersError }] = await Promise.all([
-    auth.supabase.from("pairs").select("id, name, icon_url").eq("id", pairId).maybeSingle(),
-    auth.supabase.from("pair_member_profiles").select("user_id, display_name").eq("pair_id", pairId),
+    auth.supabase.from("pairs").select("id, name, icon_url, created_by, deleted_at").eq("id", pairId).maybeSingle(),
+    auth.supabase.from("pair_member_profiles").select("user_id, display_name, role").eq("pair_id", pairId),
   ]);
 
   if (pairError) return jsonError(pairError.message, 400);
@@ -74,12 +74,35 @@ export async function PATCH(request: NextRequest) {
   const displayName = requiredString(body?.display_name);
   if (!pairId || !pairName || !displayName) return jsonError("ペア名と表示名を入力してください。", 422);
 
-  const [{ error: pairError }, { error: memberError }] = await Promise.all([
-    auth.supabase.from("pairs").update({ name: pairName, icon_url: body?.icon_url || null }).eq("id", pairId),
+  const [{ data: pair, error: pairError }, { error: memberError }] = await Promise.all([
+    auth.supabase.from("pairs").update({ name: pairName, icon_url: body?.icon_url || null }).eq("id", pairId).is("deleted_at", null).select("id").maybeSingle(),
     auth.supabase.from("pair_members").update({ display_name: displayName }).eq("pair_id", pairId).eq("user_id", auth.user.id),
   ]);
 
   if (pairError) return jsonError(pairError.message, 400);
   if (memberError) return jsonError(memberError.message, 400);
+  if (!pair) return jsonError("ペアの作成者だけが設定を編集できます。", 403);
   return jsonOk({ updated: true });
+}
+
+export async function DELETE(request: NextRequest) {
+  const auth = await requireApiUser(request);
+  if ("error" in auth) return auth.error;
+
+  const body = await request.json().catch(() => null);
+  const pairId = requiredString(body?.pair_id);
+  if (!pairId) return jsonError("削除するペアを確認できません。", 422);
+
+  const { data, error } = await auth.supabase
+    .from("pairs")
+    .update({ deleted_at: new Date().toISOString() })
+    .eq("id", pairId)
+    .eq("created_by", auth.user.id)
+    .is("deleted_at", null)
+    .select("id, deleted_at")
+    .maybeSingle();
+
+  if (error) return jsonError(error.message, 400);
+  if (!data) return jsonError("ペアの作成者だけが削除できます。", 403);
+  return jsonOk(data);
 }
