@@ -471,7 +471,7 @@ function MoneyApp({
   }
 
   function buttonLabel(action: string, idle: string, busy = "処理中...") {
-    return pendingAction === action ? busy : idle;
+    return pendingAction === action ? <><ButtonSpinner />{busy}</> : idle;
   }
 
   function personId(person: Person) {
@@ -729,10 +729,10 @@ function MoneyApp({
   }
 
   async function savePairSettings() {
-    if (!activePairId) return;
+    if (!activePairId) return false;
     if (!pairForm.name.trim() || !pairForm.displayName.trim()) {
       setMessage("ペア名とペア内の表示名を入力してください。");
-      return;
+      return false;
     }
     markPending("savePairSettings", "ペア設定を保存");
     try {
@@ -742,8 +742,10 @@ function MoneyApp({
       });
       setMessage("ペア設定を保存しました。");
       await refreshAll();
+      return true;
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "ペア設定を保存できませんでした。");
+      return false;
     } finally {
       clearPending("savePairSettings");
     }
@@ -812,9 +814,9 @@ function MoneyApp({
       } else {
         await apiRequest<Workplace>("/api/workplaces", { method: "POST", body: JSON.stringify(payload) });
       }
+      await refreshAll();
       setMessage(editingWorkplaceId ? "勤務先を更新しました。" : "勤務先を追加しました。");
       resetWorkplaceForm();
-      await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "勤務先を保存できませんでした。");
     } finally {
@@ -843,10 +845,10 @@ function MoneyApp({
       setMessage("ペア内で使用する自分の表示名を入力してください。");
       return;
     }
-    const code = makeInviteCode();
-    const codeHash = await sha256(code);
     markPending("createPair", "ペアを作成");
     try {
+      const code = makeInviteCode();
+      const codeHash = await sha256(code);
       const createdPair = await apiRequest<PairApiState>("/api/pair", {
         method: "POST",
         body: JSON.stringify({ pair_name: nameForPair, invite_hash: codeHash, display_name: nameForMe, icon_url: pairForm.iconUrl || null }),
@@ -873,9 +875,9 @@ function MoneyApp({
       setMessage("表示名と招待コードを入力してください。");
       return;
     }
-    const codeHash = await sha256(joinCode.trim().toUpperCase());
     markPending("joinPair", "ペアに参加");
     try {
+      const codeHash = await sha256(joinCode.trim().toUpperCase());
       const joinedPair = await apiRequest<PairApiState>("/api/pair/join", {
         method: "POST",
         body: JSON.stringify({ invite_hash: codeHash, display_name: displayName.trim() }),
@@ -1100,9 +1102,9 @@ function MoneyApp({
         method: "PATCH",
         body: JSON.stringify(entryForm),
       });
+      await refreshAll();
       setMessage("収支を更新しました。");
       setEditingEntryId(null);
-      await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "収支を更新できませんでした。");
     } finally {
@@ -1271,10 +1273,10 @@ function MoneyApp({
         method: "PATCH",
         body: JSON.stringify({ name: editingCategoryName.trim() }),
       });
+      await refreshAll();
       setMessage("カテゴリを更新しました。");
       setEditingCategoryId(null);
       setEditingCategoryName("");
-      await refreshAll();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "カテゴリを更新できませんでした。");
     } finally {
@@ -1299,18 +1301,47 @@ function MoneyApp({
   async function changePassword() {
     const nextPassword = window.prompt("新しいパスワードを入力してください");
     if (!nextPassword) return;
-    const { error } = await supabase.auth.updateUser({ password: nextPassword });
-    setMessage(error ? error.message : "パスワードを変更しました。");
+    markPending("changePassword", "パスワードを変更");
+    try {
+      const { error } = await supabase.auth.updateUser({ password: nextPassword });
+      if (error) throw error;
+      setMessage("パスワードを変更しました。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "パスワードを変更できませんでした。");
+    } finally {
+      clearPending("changePassword");
+    }
   }
 
-  function exportWorkbook(rows: unknown[], sheetName: string, filename: string) {
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rows), sheetName);
-    XLSX.writeFile(workbook, filename);
+  async function signOut() {
+    markPending("signOut", "ログアウト");
+    try {
+      const { error } = await supabase.auth.signOut();
+      if (error) throw error;
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "ログアウトできませんでした。");
+    } finally {
+      clearPending("signOut");
+    }
+  }
+
+  async function exportWorkbook(rows: unknown[], sheetName: string, filename: string, action: string) {
+    markPending(action, "Excelを作成");
+    try {
+      await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rows), sheetName);
+      XLSX.writeFile(workbook, filename);
+      setMessage("Excelを出力しました。");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Excelを出力できませんでした。");
+    } finally {
+      clearPending(action);
+    }
   }
 
   return (
-    <main className="app-shell">
+    <main className={pendingAction ? "app-shell is-busy" : "app-shell"} aria-busy={Boolean(pendingAction)}>
       <header className="mobile-header">
         <button className="icon-button" onClick={() => setMenuOpen(true)} aria-label="メニューを開く">
           <Menu size={22} />
@@ -1340,7 +1371,7 @@ function MoneyApp({
           <NavButton icon={<RefreshCcw />} label="サブスク" href="/subscriptions" active={view.startsWith("subscription")} />
           {(pairId || loans.length > 0) && <NavButton icon={<HandCoins />} label="貸し借り" href="/loans" active={view.startsWith("loan")} />}
           <NavButton icon={<Banknote />} label="個人収支" href="/personal" active={view.startsWith("personal")} />
-          <NavButton icon={<UserRound />} label="Myページ" href="/my-page" active={view === "myPage"} />
+          <NavButton icon={<UserRound />} label="マイページ" href="/my-page" active={view === "myPage"} />
         </nav>
       </aside>
       {menuOpen && <button className="drawer-backdrop" onClick={() => setMenuOpen(false)} aria-label="メニューを閉じる" />}
@@ -1379,7 +1410,9 @@ function MoneyApp({
             personLabel={personLabel}
             toPerson={toPerson}
             deleteSubscription={deleteSubscription}
-            exportRows={() => exportWorkbook(subscriptions, "サブスク", `サブスク_${selectedMonth}.xlsx`)}
+            pendingAction={pendingAction}
+            buttonLabel={buttonLabel}
+            exportRows={() => exportWorkbook(subscriptions, "サブスク", `サブスク_${selectedMonth}.xlsx`, "exportSubscriptions")}
           />
         )}
 
@@ -1402,6 +1435,8 @@ function MoneyApp({
             personLabel={personLabel}
             toPerson={toPerson}
             deleteSubscription={deleteSubscription}
+            pendingAction={pendingAction}
+            buttonLabel={buttonLabel}
           />
         )}
 
@@ -1426,7 +1461,9 @@ function MoneyApp({
               currentUserId={user.id}
               activePairId={activePairId}
               deleteLoan={deleteLoan}
-              exportRows={() => exportWorkbook(loans, "貸し借り", `貸し借り_${selectedMonth}.xlsx`)}
+              pendingAction={pendingAction}
+              buttonLabel={buttonLabel}
+              exportRows={() => exportWorkbook(loans, "貸し借り", `貸し借り_${selectedMonth}.xlsx`, "exportLoans")}
             />
           ) : (
             <EmptyState text="ペアを作成すると貸し借り機能を使えます。" />
@@ -1457,6 +1494,8 @@ function MoneyApp({
             currentUserId={user.id}
             deleteLoan={deleteLoan}
             readOnly={selectedLoan?.pair_id !== activePairId}
+            pendingAction={pendingAction}
+            buttonLabel={buttonLabel}
           /> : <EmptyState text={pairResolved ? "ペアを作成すると貸し借り機能を使えます。" : "ペア情報を確認しています。"} />
         )}
 
@@ -1485,7 +1524,9 @@ function MoneyApp({
             setEditingEntryId={setEditingEntryId}
             updateEntry={updateEntry}
             deleteEntry={deleteEntry}
-            exportRows={() => exportWorkbook(monthEntries, "個人収支", `個人収支_${selectedMonth}.xlsx`)}
+            pendingAction={pendingAction}
+            buttonLabel={buttonLabel}
+            exportRows={() => exportWorkbook(monthEntries, "個人収支", `個人収支_${selectedMonth}.xlsx`, "exportEntries")}
           />
         )}
 
@@ -1537,7 +1578,7 @@ function MoneyApp({
             createPair={createPair}
             joinPair={joinPair}
             changePassword={changePassword}
-            signOut={() => supabase.auth.signOut()}
+            signOut={signOut}
             setMessage={setMessage}
             workplaces={workplaces}
             workplaceForm={workplaceForm}
@@ -1644,6 +1685,8 @@ function SubscriptionsList({
   personLabel,
   toPerson,
   deleteSubscription,
+  pendingAction,
+  buttonLabel,
   exportRows,
 }: {
   subscriptions: Subscription[];
@@ -1651,11 +1694,13 @@ function SubscriptionsList({
   personLabel: (person: Person) => string;
   toPerson: (id: string) => Person;
   deleteSubscription: (subscriptionId: string) => void;
+  pendingAction: string | null;
+  buttonLabel: (action: string, idle: string, busy?: string) => React.ReactNode;
   exportRows: () => void;
 }) {
   return (
     <section className="view">
-      <PageHead title="サブスク一覧" backHref="/" actions={<><Link className="button primary" href="/subscriptions/new"><Plus size={16} />追加</Link><button className="button ghost" onClick={exportRows}><Download size={16} />Excel</button></>} />
+      <PageHead title="サブスク一覧" backHref="/" actions={<><Link className="button primary" href="/subscriptions/new"><Plus size={16} />追加</Link><button className="button ghost" disabled={Boolean(pendingAction)} onClick={exportRows}>{pendingAction !== "exportSubscriptions" && <Download size={16} />}{buttonLabel("exportSubscriptions", "Excel", "作成中...")}</button></>} />
       <div className="ledger-list">
         {subscriptions.map((subscription) => (
           <div className="ledger-row action-row" key={subscription.id}>
@@ -1671,8 +1716,8 @@ function SubscriptionsList({
               <Link className="icon-button" aria-label="サブスクを編集" title="編集" href={`/subscriptions/${subscription.id}/edit`}>
                 <Pencil size={18} />
               </Link>
-              <button className="icon-button danger-icon" aria-label="サブスクを停止" title="停止" onClick={() => deleteSubscription(subscription.id)}>
-                <Trash2 size={18} />
+              <button className="icon-button danger-icon" aria-label="サブスクを停止" title="停止" disabled={Boolean(pendingAction)} onClick={() => deleteSubscription(subscription.id)}>
+                {pendingAction === `deleteSubscription:${subscription.id}` ? <ButtonSpinner /> : <Trash2 size={18} />}
               </button>
             </div>
           </div>
@@ -1689,12 +1734,16 @@ function SubscriptionDetailView({
   personLabel,
   toPerson,
   deleteSubscription,
+  pendingAction,
+  buttonLabel,
 }: {
   subscription?: Subscription;
   selectedMonth: string;
   personLabel: (person: Person) => string;
   toPerson: (id: string) => Person;
   deleteSubscription: (subscriptionId: string) => void;
+  pendingAction: string | null;
+  buttonLabel: (action: string, idle: string, busy?: string) => React.ReactNode;
 }) {
   if (!subscription) {
     return (
@@ -1710,7 +1759,7 @@ function SubscriptionDetailView({
       <PageHead
         title="サブスク詳細"
         backHref="/subscriptions"
-        actions={<><Link className="button ghost" href={`/subscriptions/${subscription.id}/edit`}><Pencil size={16} />編集</Link><button className="button danger" onClick={() => deleteSubscription(subscription.id)}><Trash2 size={16} />停止</button></>}
+        actions={<><Link className="button ghost" href={`/subscriptions/${subscription.id}/edit`}><Pencil size={16} />編集</Link><button className="button danger" disabled={Boolean(pendingAction)} onClick={() => deleteSubscription(subscription.id)}>{pendingAction !== `deleteSubscription:${subscription.id}` && <Trash2 size={16} />}{buttonLabel(`deleteSubscription:${subscription.id}`, "停止", "停止中...")}</button></>}
       />
       <Panel title={subscription.name} action={subscription.status === "active" ? "利用中" : "停止済み"}>
         <dl className="detail-list">
@@ -1745,7 +1794,7 @@ function SubscriptionFormView({
   partnerName: string;
   onSubmit: () => void;
   title?: string;
-  submitLabel?: string;
+  submitLabel?: React.ReactNode;
   disabled?: boolean;
 }) {
   return (
@@ -1815,6 +1864,8 @@ function LoansList({
   currentUserId,
   activePairId,
   deleteLoan,
+  pendingAction,
+  buttonLabel,
   exportRows,
 }: {
   loans: Loan[];
@@ -1822,6 +1873,8 @@ function LoansList({
   currentUserId: string;
   activePairId: string | null;
   deleteLoan: (loanId: string) => void;
+  pendingAction: string | null;
+  buttonLabel: (action: string, idle: string, busy?: string) => React.ReactNode;
   exportRows: () => void;
 }) {
   return (
@@ -1829,7 +1882,7 @@ function LoansList({
       <PageHead
         title="貸し借り一覧"
         backHref="/"
-        actions={<>{canAddLoan && <Link className="button primary" href="/loans/new"><Plus size={16} />追加</Link>}<button className="button ghost" onClick={exportRows}><Download size={16} />Excel</button></>}
+        actions={<>{canAddLoan && <Link className="button primary" href="/loans/new"><Plus size={16} />追加</Link>}<button className="button ghost" disabled={Boolean(pendingAction)} onClick={exportRows}>{pendingAction !== "exportLoans" && <Download size={16} />}{buttonLabel("exportLoans", "Excel", "作成中...")}</button></>}
       />
       <div className="ledger-list">
         {loans.map((loan) => {
@@ -1849,8 +1902,8 @@ function LoansList({
                   <Link className="icon-button" aria-label="貸し借りを編集" title="編集" href={`/loans/${loan.id}/edit`}>
                     <Pencil size={18} />
                   </Link>
-                  <button className="icon-button danger-icon" aria-label="貸し借りを削除" title="削除" onClick={() => deleteLoan(loan.id)}>
-                    <Trash2 size={18} />
+                  <button className="icon-button danger-icon" aria-label="貸し借りを削除" title="削除" disabled={Boolean(pendingAction)} onClick={() => deleteLoan(loan.id)}>
+                    {pendingAction === `deleteLoan:${loan.id}` ? <ButtonSpinner /> : <Trash2 size={18} />}
                   </button>
                 </div>
               )}
@@ -1874,6 +1927,8 @@ function LoanDetailView({
   currentUserId,
   deleteLoan,
   readOnly,
+  pendingAction,
+  buttonLabel,
 }: {
   loan?: Loan;
   selectedMonth: string;
@@ -1885,6 +1940,8 @@ function LoanDetailView({
   currentUserId: string;
   deleteLoan: (loanId: string) => void;
   readOnly: boolean;
+  pendingAction: string | null;
+  buttonLabel: (action: string, idle: string, busy?: string) => React.ReactNode;
 }) {
   if (!loan) {
     return (
@@ -1903,7 +1960,7 @@ function LoanDetailView({
       <PageHead
         title="貸し借り詳細"
         backHref="/loans"
-        actions={canManage ? <><Link className="button ghost" href={`/loans/${loan.id}/edit`}><Pencil size={16} />編集</Link><button className="button danger" onClick={() => deleteLoan(loan.id)}><Trash2 size={16} />削除</button></> : undefined}
+        actions={canManage ? <><Link className="button ghost" href={`/loans/${loan.id}/edit`}><Pencil size={16} />編集</Link><button className="button danger" disabled={Boolean(pendingAction)} onClick={() => deleteLoan(loan.id)}>{pendingAction !== `deleteLoan:${loan.id}` && <Trash2 size={16} />}{buttonLabel(`deleteLoan:${loan.id}`, "削除", "削除中...")}</button></> : undefined}
       />
       <Panel title={loan.title} action={remaining === 0 ? "完済済み" : `残金 ${yen.format(remaining)}`}>
         <dl className="detail-list">
@@ -1923,7 +1980,7 @@ function LoanDetailView({
           <div className="repayment-form detail-repayment-form">
             <NumberField label="返済金額" unit="円" value={draft.amount} onChange={(amount) => setRepaymentDrafts({ ...repaymentDrafts, [loan.id]: { ...draft, amount } })} />
             <TextField label="返済日" unit="年月日・任意" type="date" value={draft.paid_at} onChange={(paid_at) => setRepaymentDrafts({ ...repaymentDrafts, [loan.id]: { ...draft, paid_at } })} />
-            <button className="button dark" onClick={() => addRepayment(loan.id)}><CheckCircle2 size={16} />返済登録</button>
+            <button className="button dark" disabled={Boolean(pendingAction)} onClick={() => addRepayment(loan.id)}>{pendingAction !== `addRepayment:${loan.id}` && <CheckCircle2 size={16} />}{buttonLabel(`addRepayment:${loan.id}`, "返済登録", "登録中...")}</button>
           </div>
         </Panel>
       )}
@@ -1966,7 +2023,7 @@ function LoanFormView({
   partnerName: string;
   onSubmit: () => void;
   title?: string;
-  submitLabel?: string;
+  submitLabel?: React.ReactNode;
   disabled?: boolean;
 }) {
   return (
@@ -2003,6 +2060,8 @@ function PersonalList({
   setEditingEntryId,
   updateEntry,
   deleteEntry,
+  pendingAction,
+  buttonLabel,
   exportRows,
 }: {
   entries: PersonalEntry[];
@@ -2015,11 +2074,13 @@ function PersonalList({
   setEditingEntryId: (id: string | null) => void;
   updateEntry: (entryId: string) => void;
   deleteEntry: (entryId: string) => void;
+  pendingAction: string | null;
+  buttonLabel: (action: string, idle: string, busy?: string) => React.ReactNode;
   exportRows: () => void;
 }) {
   return (
     <section className="view">
-      <PageHead title="個人収支一覧" backHref="/" actions={<button className="button ghost" onClick={exportRows}><Download size={16} />Excel</button>} />
+      <PageHead title="個人収支一覧" backHref="/" actions={<button className="button ghost" disabled={Boolean(pendingAction)} onClick={exportRows}>{pendingAction !== "exportEntries" && <Download size={16} />}{buttonLabel("exportEntries", "Excel", "作成中...")}</button>} />
       <div className="button-row action-grid">
         <Link className="button primary" href="/personal/income/new"><Plus size={16} />収入を追加</Link>
         <Link className="button dark" href="/personal/expense/new"><Plus size={16} />支出を追加</Link>
@@ -2061,8 +2122,8 @@ function PersonalList({
                 >
                   <Pencil size={18} />
                 </button>
-                <button className="icon-button danger-icon" aria-label="収支を削除" title="削除" onClick={() => deleteEntry(entry.id)}>
-                  <Trash2 size={18} />
+                <button className="icon-button danger-icon" aria-label="収支を削除" title="削除" disabled={Boolean(pendingAction)} onClick={() => deleteEntry(entry.id)}>
+                  {pendingAction === `deleteEntry:${entry.id}` ? <ButtonSpinner /> : <Trash2 size={18} />}
                 </button>
               </div>
             </div>
@@ -2070,8 +2131,8 @@ function PersonalList({
               <div className="inline-editor">
                 <PersonalEntryFields form={entryForm} setForm={setEntryForm} categories={categories} />
                 <div className="button-row">
-                  <button className="button primary" onClick={() => updateEntry(entry.id)}><Save size={16} />保存</button>
-                  <button className="button ghost" onClick={() => setEditingEntryId(null)}>キャンセル</button>
+                  <button className="button primary" disabled={Boolean(pendingAction)} onClick={() => updateEntry(entry.id)}>{pendingAction !== `updateEntry:${entry.id}` && <Save size={16} />}{buttonLabel(`updateEntry:${entry.id}`, "保存", "保存中...")}</button>
+                  <button className="button ghost" disabled={Boolean(pendingAction)} onClick={() => setEditingEntryId(null)}>キャンセル</button>
                 </div>
               </div>
             )}
@@ -2095,7 +2156,7 @@ function PersonalEntryFormView({
   setForm: (form: ReturnType<typeof makeEntryDefaults>) => void;
   categories: PersonalCategory[];
   onSubmit: () => void;
-  submitLabel?: string;
+  submitLabel?: React.ReactNode;
   disabled?: boolean;
 }) {
   const options = categories.filter((category) => category.type === form.type).map((category) => [category.name, category.name] as [string, string]);
@@ -2158,7 +2219,7 @@ function CategoryFormView({
   updateCategory: (category: PersonalCategory) => void;
   deleteCategory: (category: PersonalCategory) => void;
   pendingAction: string | null;
-  buttonLabel: (action: string, idle: string, busy?: string) => string;
+  buttonLabel: (action: string, idle: string, busy?: string) => React.ReactNode;
 }) {
   return (
     <section className="view">
@@ -2191,13 +2252,13 @@ function CategoryFormView({
                 <div className="icon-actions">
                   {editingCategoryId === category.id ? (
                     <>
-                      <button className="icon-button" aria-label="カテゴリを保存" title="保存" disabled={Boolean(pendingAction)} onClick={() => updateCategory(category)}><Save size={18} /></button>
-                      <button className="icon-button" aria-label="編集をキャンセル" title="キャンセル" onClick={() => setEditingCategoryId(null)}><X size={18} /></button>
+                      <button className="icon-button" aria-label="カテゴリを保存" title="保存" disabled={Boolean(pendingAction)} onClick={() => updateCategory(category)}>{pendingAction === `updateCategory:${category.id}` ? <ButtonSpinner /> : <Save size={18} />}</button>
+                      <button className="icon-button" aria-label="編集をキャンセル" title="キャンセル" disabled={Boolean(pendingAction)} onClick={() => setEditingCategoryId(null)}><X size={18} /></button>
                     </>
                   ) : (
                     <>
-                      <button className="icon-button" aria-label="カテゴリを編集" title="編集" onClick={() => { setEditingCategoryId(category.id); setEditingCategoryName(category.name); }}><Pencil size={18} /></button>
-                      <button className="icon-button danger-icon" aria-label="カテゴリを削除" title="削除" disabled={Boolean(pendingAction)} onClick={() => deleteCategory(category)}><Trash2 size={18} /></button>
+                      <button className="icon-button" aria-label="カテゴリを編集" title="編集" disabled={Boolean(pendingAction)} onClick={() => { setEditingCategoryId(category.id); setEditingCategoryName(category.name); }}><Pencil size={18} /></button>
+                      <button className="icon-button danger-icon" aria-label="カテゴリを削除" title="削除" disabled={Boolean(pendingAction)} onClick={() => deleteCategory(category)}>{pendingAction === `deleteCategory:${category.id}` ? <ButtonSpinner /> : <Trash2 size={18} />}</button>
                     </>
                   )}
                 </div>
@@ -2279,7 +2340,7 @@ function MyPageView({
   pairInfo: PairInfo | null;
   pairForm: { name: string; displayName: string; iconUrl: string };
   setPairForm: (form: { name: string; displayName: string; iconUrl: string }) => void;
-  savePairSettings: () => void;
+  savePairSettings: () => Promise<boolean>;
   requestOrConfirmPairDissolution: () => void;
   cancelPairDissolution: () => void;
   members: PairMember[];
@@ -2303,9 +2364,10 @@ function MyPageView({
   deleteWorkplace: (id: string) => void;
   resetWorkplaceForm: () => void;
   pendingAction: string | null;
-  buttonLabel: (action: string, idle: string, busy?: string) => string;
+  buttonLabel: (action: string, idle: string, busy?: string) => React.ReactNode;
 }) {
   const [editingPair, setEditingPair] = useState(false);
+  const [copyingInvite, setCopyingInvite] = useState(false);
   // The active membership is the source of truth for showing pair actions.
   // Keep these actions visible even while editing or while pair details refresh.
   const canManagePair = Boolean(pairId);
@@ -2314,17 +2376,20 @@ function MyPageView({
 
   async function copyInviteCode() {
     if (!inviteCode) return;
+    setCopyingInvite(true);
     try {
       await navigator.clipboard.writeText(inviteCode);
       setMessage("招待コードをコピーしました。");
     } catch {
       setMessage("コピーできませんでした。表示されたコードを長押ししてコピーしてください。");
+    } finally {
+      setCopyingInvite(false);
     }
   }
 
   return (
     <section className="view">
-      <PageHead title="Myページ" backHref="/" />
+      <PageHead title="マイページ" backHref="/" />
       <Panel title="自分の情報" action={user.email || ""}>
         <ImagePicker label="プロフィールアイコン" imageUrl={profileAvatarUrl} onChange={setProfileAvatarUrl} onMessage={setMessage} />
         <div className="stack-form">
@@ -2332,8 +2397,8 @@ function MyPageView({
         </div>
         <div className="button-row">
           <button className="button primary" onClick={saveProfile} disabled={Boolean(pendingAction)}>{buttonLabel("saveProfile", "保存", "保存中...")}</button>
-          <button className="button ghost" onClick={changePassword}><KeyRound size={16} />パスワード変更</button>
-          <button className="button danger" onClick={signOut}><LogOut size={16} />ログアウト</button>
+          <button className="button ghost" disabled={Boolean(pendingAction)} onClick={changePassword}>{pendingAction !== "changePassword" && <KeyRound size={16} />}{buttonLabel("changePassword", "パスワード変更", "変更中...")}</button>
+          <button className="button danger" disabled={Boolean(pendingAction)} onClick={signOut}>{pendingAction !== "signOut" && <LogOut size={16} />}{buttonLabel("signOut", "ログアウト", "ログアウト中...")}</button>
         </div>
       </Panel>
 
@@ -2352,7 +2417,7 @@ function MyPageView({
               {canManagePair && (
                 <div className="icon-actions">
                   <button className="icon-button" aria-label="ペア設定を編集" title="編集" disabled={Boolean(pendingAction)} onClick={() => setEditingPair(true)}><Pencil size={18} /></button>
-                  <button className="icon-button danger-icon" aria-label="ペアを削除（解消申請）" title="削除" disabled={Boolean(pendingAction) || dissolutionRequestedByMe} onClick={requestOrConfirmPairDissolution}><Trash2 size={18} /></button>
+                  <button className="icon-button danger-icon" aria-label="ペアを削除（解消申請）" title="削除" disabled={Boolean(pendingAction) || dissolutionRequestedByMe} onClick={requestOrConfirmPairDissolution}>{pendingAction === "dissolvePair" ? <ButtonSpinner /> : <Trash2 size={18} />}</button>
                 </div>
               )}
             </div>
@@ -2363,8 +2428,8 @@ function MyPageView({
                 <TextField label="ペア名" unit="文字" value={pairForm.name} onChange={(name) => setPairForm({ ...pairForm, name })} />
                 <TextField label="ペア内で使用する自分の表示名" unit="文字" value={pairForm.displayName} onChange={(displayNameValue) => setPairForm({ ...pairForm, displayName: displayNameValue })} />
                 <div className="button-row">
-                  <button className="button primary" onClick={() => { savePairSettings(); setEditingPair(false); }} disabled={Boolean(pendingAction)}><Save size={16} />{buttonLabel("savePairSettings", "保存する", "保存中...")}</button>
-                  <button className="button ghost" onClick={() => setEditingPair(false)}>キャンセル</button>
+                  <button className="button primary" onClick={async () => { if (await savePairSettings()) setEditingPair(false); }} disabled={Boolean(pendingAction)}>{pendingAction !== "savePairSettings" && <Save size={16} />}{buttonLabel("savePairSettings", "保存する", "保存中...")}</button>
+                  <button className="button ghost" disabled={Boolean(pendingAction)} onClick={() => setEditingPair(false)}>キャンセル</button>
                 </div>
               </div>
             )}
@@ -2397,7 +2462,7 @@ function MyPageView({
             {!partner && inviteCode && (
               <>
                 <div className="button-row">
-                  <button className="button ghost" onClick={copyInviteCode}><Copy size={16} />作成時の招待コードをコピー</button>
+                  <button className="button ghost" disabled={copyingInvite || Boolean(pendingAction)} onClick={copyInviteCode}>{copyingInvite ? <><ButtonSpinner />コピー中...</> : <><Copy size={16} />作成時の招待コードをコピー</>}</button>
                 </div>
                 <div className="invite-code">{inviteCode}</div>
               </>
@@ -2439,7 +2504,7 @@ function MyPageView({
         </div>
         <div className="button-row">
           <button className="button primary" onClick={saveWorkplace} disabled={Boolean(pendingAction)}>{buttonLabel("saveWorkplace", editingWorkplaceId ? "更新する" : "追加する", editingWorkplaceId ? "更新中..." : "追加中...")}</button>
-          {editingWorkplaceId && <button className="button ghost" onClick={resetWorkplaceForm}>キャンセル</button>}
+          {editingWorkplaceId && <button className="button ghost" disabled={Boolean(pendingAction)} onClick={resetWorkplaceForm}>キャンセル</button>}
         </div>
         <div className="ledger-list workplace-list">
           {workplaces.map((workplace) => (
@@ -2454,6 +2519,7 @@ function MyPageView({
                   className="icon-button"
                   aria-label="勤務先を編集"
                   title="編集"
+                  disabled={Boolean(pendingAction)}
                   onClick={() => {
                     setEditingWorkplaceId(workplace.id);
                     setWorkplaceForm({
@@ -2466,7 +2532,7 @@ function MyPageView({
                   <Pencil size={18} />
                 </button>
                 <button className="icon-button danger-icon" aria-label="勤務先を削除" title="削除" disabled={Boolean(pendingAction)} onClick={() => deleteWorkplace(workplace.id)}>
-                  <Trash2 size={18} />
+                  {pendingAction === `deleteWorkplace:${workplace.id}` ? <ButtonSpinner /> : <Trash2 size={18} />}
                 </button>
               </div>
             </div>
@@ -2495,21 +2561,27 @@ function AuthScreen({ supabase }: { supabase: SupabaseClient }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [message, setMessage] = useState("");
+  const [authPending, setAuthPending] = useState(false);
 
   async function submit() {
     setMessage("");
-    const result =
-      mode === "signin"
-        ? await supabase.auth.signInWithPassword({ email, password })
-        : await supabase.auth.signUp({
-            email,
-            password,
-            options: {
-              emailRedirectTo: `${process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") || window.location.origin}/auth/confirm`,
-            },
-          });
-    if (result.error) setMessage(result.error.message);
-    else if (mode === "signup") setMessage("登録しました。メールを確認してください。");
+    setAuthPending(true);
+    try {
+      const result =
+        mode === "signin"
+          ? await supabase.auth.signInWithPassword({ email, password })
+          : await supabase.auth.signUp({
+              email,
+              password,
+              options: {
+                emailRedirectTo: `${process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/$/, "") || window.location.origin}/auth/confirm`,
+              },
+            });
+      if (result.error) setMessage(result.error.message);
+      else if (mode === "signup") setMessage("登録しました。メールを確認してください。");
+    } finally {
+      setAuthPending(false);
+    }
   }
 
   return (
@@ -2523,16 +2595,20 @@ function AuthScreen({ supabase }: { supabase: SupabaseClient }) {
           </div>
         </div>
         <div className="segmented">
-          <button className={mode === "signin" ? "active" : ""} onClick={() => setMode("signin")}>ログイン</button>
-          <button className={mode === "signup" ? "active" : ""} onClick={() => setMode("signup")}>新規登録</button>
+          <button className={mode === "signin" ? "active" : ""} disabled={authPending} onClick={() => setMode("signin")}>ログイン</button>
+          <button className={mode === "signup" ? "active" : ""} disabled={authPending} onClick={() => setMode("signup")}>新規登録</button>
         </div>
         <TextField label="メールアドレス" value={email} onChange={setEmail} />
         <TextField label="パスワード" type="password" value={password} onChange={setPassword} />
         {message && <div className="notice">{message}</div>}
-        <button className="button primary wide" onClick={submit}>{mode === "signin" ? "ログイン" : "登録する"}</button>
+        <button className="button primary wide" disabled={authPending} onClick={submit}>{authPending ? <><ButtonSpinner />{mode === "signin" ? "ログイン中..." : "登録中..."}</> : mode === "signin" ? "ログイン" : "登録する"}</button>
       </section>
     </main>
   );
+}
+
+function ButtonSpinner() {
+  return <span className="button-spinner" aria-hidden="true" />;
 }
 
 function PageHead({ title, backHref, actions }: { title: string; backHref?: string; actions?: React.ReactNode }) {

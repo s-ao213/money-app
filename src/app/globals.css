@@ -196,6 +196,30 @@ h1 {
   opacity: 0.58;
 }
 
+.button-spinner {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 999px;
+  animation: button-spin 700ms linear infinite;
+}
+
+.icon-button .button-spinner {
+  width: 18px;
+  height: 18px;
+  flex-basis: 18px;
+}
+
+@keyframes button-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .button-spinner { animation-duration: 1400ms; }
+}
+
 .button.primary {
   border-color: var(--blue);
   background: var(--blue);
@@ -226,6 +250,14 @@ h1 {
   flex-wrap: wrap;
   gap: 10px;
   margin-top: 16px;
+}
+
+.app-shell.is-busy a,
+.app-shell.is-busy button,
+.app-shell.is-busy input,
+.app-shell.is-busy select,
+.app-shell.is-busy textarea {
+  pointer-events: none;
 }
 
 .notice {
