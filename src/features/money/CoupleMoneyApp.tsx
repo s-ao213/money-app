@@ -414,7 +414,9 @@ function MoneyApp({
   const [menuOpen, setMenuOpen] = useState(false);
   const [displayName, setDisplayName] = useState("");
   const [profileAvatarUrl, setProfileAvatarUrl] = useState("");
+  const pairStorageKey = `money-app:${user.id}:pair-id`;
   const [pairId, setPairId] = useState<string | null>(null);
+  const [pairResolved, setPairResolved] = useState(false);
   const [pairInfo, setPairInfo] = useState<PairInfo | null>(null);
   const [members, setMembers] = useState<PairMember[]>([]);
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([]);
@@ -485,6 +487,7 @@ function MoneyApp({
     if (!token) throw new Error("ログインが必要です。");
 
     const response = await fetch(path, {
+      cache: "no-store",
       ...init,
       headers: {
         "Content-Type": "application/json",
@@ -502,7 +505,7 @@ function MoneyApp({
     const profile = await apiRequest<{ display_name: string; avatar_url: string | null }>("/api/profile");
     setDisplayName(profile?.display_name || "");
     setProfileAvatarUrl(profile?.avatar_url || "");
-    const cachedPairId = window.localStorage.getItem(`money-app:${user.id}:pair-id`);
+    const cachedPairId = window.localStorage.getItem(pairStorageKey);
 
     try {
       const personalEntries = await apiRequest<PersonalEntry[]>(`/api/personal/entries`);
@@ -525,12 +528,24 @@ function MoneyApp({
       setMessage(error instanceof Error ? error.message : "サブスクを読み込めませんでした。");
     }
 
-    const pairState = await apiRequest<PairApiState>("/api/pair");
-    const nextPairId = pairState.pair_id || pairId || cachedPairId || null;
+    let pairState: PairApiState;
+    try {
+      pairState = await apiRequest<PairApiState>("/api/pair");
+    } catch (error) {
+      // Keep the pair navigation available while surfacing the database/API error.
+      // The cached id is only a UI fallback; every API request is still protected by RLS.
+      setPairId(cachedPairId);
+      setPairResolved(true);
+      setMessage(error instanceof Error ? `ペア情報を読み込めませんでした: ${error.message}` : "ペア情報を読み込めませんでした。");
+      return;
+    }
+
+    const nextPairId = pairState.pair_id || null;
     if (pairState.pair_id) {
-      window.localStorage.setItem(`money-app:${user.id}:pair-id`, pairState.pair_id);
+      window.localStorage.setItem(pairStorageKey, pairState.pair_id);
     }
     setPairId(nextPairId);
+    setPairResolved(true);
 
     try {
       const savedCategories = await apiRequest<PersonalCategory[]>(`/api/personal/categories${nextPairId ? `?pair_id=${nextPairId}` : ""}`);
@@ -540,7 +555,7 @@ function MoneyApp({
     }
 
     if (!nextPairId) {
-      window.localStorage.removeItem(`money-app:${user.id}:pair-id`);
+      window.localStorage.removeItem(pairStorageKey);
       setMembers([]);
       setLoans([]);
       setPairInfo(null);
@@ -566,6 +581,8 @@ function MoneyApp({
   }
 
   useEffect(() => {
+    const cachedPairId = window.localStorage.getItem(pairStorageKey);
+    if (cachedPairId) setPairId(cachedPairId);
     void refreshAll();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -794,8 +811,9 @@ function MoneyApp({
         body: JSON.stringify({ pair_name: nameForPair, invite_hash: codeHash, display_name: nameForMe, icon_url: pairForm.iconUrl || null }),
       });
       if (createdPair.pair_id) {
-        window.localStorage.setItem(`money-app:${user.id}:pair-id`, createdPair.pair_id);
+        window.localStorage.setItem(pairStorageKey, createdPair.pair_id);
         setPairId(createdPair.pair_id);
+        setPairResolved(true);
       }
       if (createdPair.pair) setPairInfo(createdPair.pair);
       if (createdPair.members.length) setMembers(createdPair.members);
@@ -836,10 +854,17 @@ function MoneyApp({
     const codeHash = await sha256(joinCode.trim().toUpperCase());
     markPending("joinPair", "ペアに参加");
     try {
-      await apiRequest("/api/pair/join", {
+      const joinedPair = await apiRequest<PairApiState>("/api/pair/join", {
         method: "POST",
         body: JSON.stringify({ invite_hash: codeHash, display_name: displayName.trim() }),
       });
+      if (joinedPair.pair_id) {
+        window.localStorage.setItem(pairStorageKey, joinedPair.pair_id);
+        setPairId(joinedPair.pair_id);
+        setPairResolved(true);
+      }
+      if (joinedPair.pair) setPairInfo(joinedPair.pair);
+      if (joinedPair.members.length) setMembers(joinedPair.members);
       setJoinCode("");
       setMessage("ペアに参加しました。");
       await refreshAll();
@@ -1386,7 +1411,7 @@ function MoneyApp({
         )}
 
         {view === "loanNew" && (
-          <LoanFormView
+          pairId ? <LoanFormView
             form={loanForm}
             setForm={setLoanForm}
             selfName={selfName}
@@ -1394,11 +1419,11 @@ function MoneyApp({
             onSubmit={addLoan}
             submitLabel={buttonLabel("addLoan", "登録する", "登録中...")}
             disabled={Boolean(pendingAction)}
-          />
+          /> : <EmptyState text={pairResolved ? "ペアを作成すると貸し借り機能を使えます。" : "ペア情報を確認しています。"} />
         )}
 
         {view === "loanDetail" && (
-          <LoanDetailView
+          pairId ? <LoanDetailView
             loan={selectedLoan}
             selectedMonth={selectedMonth}
             personLabel={personLabel}
@@ -1408,11 +1433,11 @@ function MoneyApp({
             addRepayment={addRepayment}
             currentUserId={user.id}
             deleteLoan={deleteLoan}
-          />
+          /> : <EmptyState text={pairResolved ? "ペアを作成すると貸し借り機能を使えます。" : "ペア情報を確認しています。"} />
         )}
 
         {view === "loanEdit" && (
-          <LoanFormView
+          pairId ? <LoanFormView
             form={loanForm}
             setForm={setLoanForm}
             selfName={selfName}
@@ -1421,7 +1446,7 @@ function MoneyApp({
             title="貸し借り編集"
             submitLabel={buttonLabel("updateLoan", "更新する", "更新中...")}
             disabled={Boolean(pendingAction)}
-          />
+          /> : <EmptyState text={pairResolved ? "ペアを作成すると貸し借り機能を使えます。" : "ペア情報を確認しています。"} />
         )}
 
         {view === "personal" && (

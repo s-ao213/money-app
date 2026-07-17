@@ -9,10 +9,10 @@ export async function GET(request: NextRequest) {
     .from("pair_members")
     .select("pair_id")
     .eq("user_id", auth.user.id)
-    .limit(1);
+    .maybeSingle();
 
   if (memberError) return jsonError(memberError.message, 400);
-  const pairId = memberships?.[0]?.pair_id || null;
+  const pairId = memberships?.pair_id || null;
   if (!pairId) return jsonOk({ pair_id: null, pair: null, members: [] });
 
   const [{ data: pair, error: pairError }, { data: members, error: membersError }] = await Promise.all([
@@ -48,10 +48,10 @@ export async function POST(request: NextRequest) {
     .from("pair_members")
     .select("pair_id")
     .eq("user_id", auth.user.id)
-    .limit(1);
+    .maybeSingle();
   if (memberError) return jsonError(memberError.message, 400);
 
-  const pairId = memberships?.[0]?.pair_id || null;
+  const pairId = memberships?.pair_id || null;
   if (!pairId) return jsonOk({ pair_id: null, pair: null, members: [] }, { status: 201 });
 
   const [{ data: pair, error: pairError }, { data: members, error: membersError }] = await Promise.all([

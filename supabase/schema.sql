@@ -162,6 +162,10 @@ create unique index if not exists personal_entries_generated_unique
 on public.personal_entries (user_id, source_type, source_id, period_key, scheduled_date)
 where source_type <> 'manual' and source_id is not null and period_key is not null and scheduled_date is not null;
 
+-- A user keeps one permanent pair membership. This also makes pair lookup deterministic.
+create unique index if not exists pair_members_user_unique
+on public.pair_members (user_id);
+
 create or replace function public.touch_updated_at()
 returns trigger
 language plpgsql
@@ -256,6 +260,10 @@ begin
     raise exception 'Not authenticated';
   end if;
 
+  if exists (select 1 from public.pair_members where user_id = auth.uid()) then
+    raise exception 'すでにペアへ登録されています';
+  end if;
+
   insert into public.profiles (id, display_name)
   values (auth.uid(), coalesce(nullif(display_name_input, ''), '私'))
   on conflict (id) do update set display_name = excluded.display_name;
@@ -286,6 +294,10 @@ declare
 begin
   if auth.uid() is null then
     raise exception 'Not authenticated';
+  end if;
+
+  if exists (select 1 from public.pair_members where user_id = auth.uid()) then
+    raise exception 'すでにペアへ登録されています';
   end if;
 
   select id into target_pair_id
@@ -553,9 +565,20 @@ for delete to authenticated
 using (user_id = (select auth.uid()));
 
 grant usage on schema public to anon, authenticated;
+grant select, insert, update on public.profiles to authenticated;
+grant select, update on public.pairs to authenticated;
+grant select, update on public.pair_members to authenticated;
+grant select, insert, update, delete on public.subscriptions to authenticated;
+grant select, insert, update, delete on public.loans to authenticated;
+grant select, insert on public.loan_repayments to authenticated;
+grant select, insert, update, delete on public.personal_entries to authenticated;
 grant select, insert, update, delete on public.workplaces to authenticated;
 grant select, insert, update, delete on public.personal_categories to authenticated;
 grant select on public.pair_member_profiles to authenticated;
+revoke all on function public.is_pair_member(uuid) from public, anon;
+revoke all on function public.is_user_in_pair(uuid, uuid) from public, anon;
+grant execute on function public.is_pair_member(uuid) to authenticated;
+grant execute on function public.is_user_in_pair(uuid, uuid) to authenticated;
 drop function if exists public.create_pair_with_invite_hash(text, text, text);
 revoke all on function public.create_pair_with_invite_hash(text, text, text, text) from public, anon;
 revoke all on function public.join_pair_with_invite_hash(text, text) from public, anon;
